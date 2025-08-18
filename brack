@@ -110,6 +110,7 @@ parse_arguments() {
     local dry_run=false
     local cleanup_mode=false
     local files=()
+    local black_args=()
 
     while [[ $# -gt 0 ]]; do
         case $1 in
@@ -132,6 +133,18 @@ parse_arguments() {
             --cleanup)
                 cleanup_mode=true
                 shift
+                ;;
+            --black-args=*)
+                # Support --black-args="--line-length 100 --target-version py38"
+                black_args_str="${1#*=}"
+                read -ra black_args <<< "$black_args_str"
+                shift
+                ;;
+            --)
+                # Everything after -- goes to black
+                shift
+                black_args=("$@")
+                break
                 ;;
             -*)
                 error_exit "Unknown option: $1" $EXIT_INVALID_ARGS
@@ -158,6 +171,7 @@ parse_arguments() {
     export DRY_RUN="$dry_run"
     export CLEANUP_MODE="$cleanup_mode"
     export FILES=("${files[@]}")
+    export BLACK_ARGS=("${black_args[@]}")
 }
 
 # Error state management functions
@@ -771,23 +785,171 @@ create_or_reuse_formatting_branch() {
     fi
 }
 
+# Black formatting integration functions
+check_black_availability() {
+    if command -v black >/dev/null 2>&1; then
+        local black_path
+        black_path=$(command -v black)
+        if [[ "$QUIET_MODE" != "true" ]]; then
+            log_info "Black formatter found: $black_path"
+        fi
+        return 0
+    else
+        create_error_state "Black formatter not found in PATH. Please install black: pip install black" "Black availability check"
+        exit $EXIT_GENERAL_ERROR
+    fi
+}
+
+get_file_checksum() {
+    local file="$1"
+    
+    if [[ ! -f "$file" ]]; then
+        echo ""
+        return 1
+    fi
+    
+    # Use md5sum or equivalent for file checksum
+    if command -v md5sum >/dev/null 2>&1; then
+        md5sum "$file" | cut -d' ' -f1
+    elif command -v md5 >/dev/null 2>&1; then
+        md5 -q "$file"
+    else
+        # Fallback to file size and modification time
+        stat -c "%s-%Y" "$file" 2>/dev/null || stat -f "%z-%m" "$file" 2>/dev/null || echo "unknown"
+    fi
+}
+
+format_files_with_black() {
+    local files_to_format=("$@")
+    local files_changed=()
+    local black_cmd_args=("black")
+    
+    if [[ ${#files_to_format[@]} -eq 0 ]]; then
+        if [[ "$QUIET_MODE" != "true" ]]; then
+            log_info "No files to format"
+        fi
+        export FORMATTED_FILES=()
+        return 0
+    fi
+    
+    # Add user-specified black arguments
+    if [[ ${#BLACK_ARGS[@]} -gt 0 ]]; then
+        black_cmd_args+=("${BLACK_ARGS[@]}")
+        if [[ "$QUIET_MODE" != "true" ]]; then
+            log_info "Using black arguments: ${BLACK_ARGS[*]}"
+        fi
+    fi
+    
+    if [[ "$QUIET_MODE" != "true" ]]; then
+        log_info "Formatting ${#files_to_format[@]} file(s) with black..."
+    fi
+    
+    # Get checksums before formatting
+    local -A checksums_before
+    for file in "${files_to_format[@]}"; do
+        checksums_before["$file"]=$(get_file_checksum "$file")
+    done
+    
+    # Run black on all files
+    black_cmd_args+=("${files_to_format[@]}")
+    
+    local black_output
+    local black_exit_code
+    
+    if black_output=$("${black_cmd_args[@]}" 2>&1); then
+        black_exit_code=0
+    else
+        black_exit_code=$?
+    fi
+    
+    if [[ $black_exit_code -ne 0 ]]; then
+        create_error_state "Black formatting failed (exit code $black_exit_code): $black_output" "Black formatting"
+        exit $EXIT_GENERAL_ERROR
+    fi
+    
+    # Check which files actually changed
+    for file in "${files_to_format[@]}"; do
+        local checksum_after
+        checksum_after=$(get_file_checksum "$file")
+        
+        if [[ "${checksums_before["$file"]}" != "$checksum_after" ]]; then
+            files_changed+=("$file")
+            if [[ "$QUIET_MODE" != "true" ]]; then
+                log_info "Formatted: $file"
+            fi
+        fi
+    done
+    
+    # Export results
+    export FORMATTED_FILES=("${files_changed[@]}")
+    
+    if [[ ${#files_changed[@]} -eq 0 ]]; then
+        if [[ "$QUIET_MODE" != "true" ]]; then
+            log_info "No files needed formatting changes"
+        fi
+    else
+        if [[ "$QUIET_MODE" != "true" ]]; then
+            log_success "Formatted ${#files_changed[@]} file(s)"
+        fi
+    fi
+    
+    return 0
+}
+
+format_existing_files() {
+    if [[ ${#EXISTING_FILES[@]} -eq 0 ]]; then
+        if [[ "$QUIET_MODE" != "true" ]]; then
+            log_info "No existing files to format"
+        fi
+        return 0
+    fi
+    
+    if [[ "$QUIET_MODE" != "true" ]]; then
+        log_info "Formatting existing files in formatting branch..."
+    fi
+    
+    format_files_with_black "${EXISTING_FILES[@]}"
+}
+
+format_new_files() {
+    if [[ ${#NEW_FILES[@]} -eq 0 ]]; then
+        if [[ "$QUIET_MODE" != "true" ]]; then
+            log_info "No new files to format"
+        fi
+        return 0
+    fi
+    
+    if [[ "$QUIET_MODE" != "true" ]]; then
+        log_info "Formatting new files in current branch..."
+    fi
+    
+    format_files_with_black "${NEW_FILES[@]}"
+}
+
 # Placeholder for main functionality (to be implemented in later steps)
 main_workflow() {
     if [[ "$DRY_RUN" == "true" ]]; then
-        log_info "DRY RUN: Would detect merge-base, validate files, create branch, stash changes, format files, and restore"
+        log_info "DRY RUN: Would check black, detect merge-base, validate files, create branch, stash changes, format files, and restore"
+        check_black_availability  # Test black availability in dry-run
         detect_and_validate_merge_base  # Test merge-base detection in dry-run
         validate_and_categorize_files   # Test file validation in dry-run
         create_or_reuse_formatting_branch  # Test branch creation in dry-run
         save_working_directory || true  # Test stashing in dry-run (don't fail if no changes)
-        log_info "DRY RUN: Would format files here"
+        log_info "DRY RUN: Would format existing files in formatting branch"
+        format_existing_files  # Test formatting existing files
+        return_to_original_branch  # Return to original branch
+        log_info "DRY RUN: Would format new files in current branch"
+        format_new_files  # Test formatting new files
         restore_working_directory || true  # Test restoration in dry-run
-        return_to_original_branch  # Test returning to original branch
         return 0
     fi
 
-    log_info "Main workflow not yet implemented - this is Step 7 foundation with branch management"
+    log_info "Main workflow not yet implemented - this is Step 8 foundation with black formatting"
     log_info "Current branch: $CURRENT_BRANCH"
     log_info "Files to process: ${FILES[*]:-all Python files}"
+    
+    # Check black availability
+    check_black_availability
     
     # Test the merge-base detection
     detect_and_validate_merge_base
@@ -800,11 +962,18 @@ main_workflow() {
     
     # Test the stashing functionality
     save_working_directory || true  # Don't fail if no changes to stash
-    log_info "This is where formatting would happen in later steps"
-    restore_working_directory || true  # Don't fail if no stash to restore
     
-    # Return to original branch
+    # Format existing files in formatting branch
+    format_existing_files
+    
+    # Return to original branch to format new files
     return_to_original_branch
+    
+    # Format new files in current branch
+    format_new_files
+    
+    # Restore stashed changes
+    restore_working_directory || true  # Don't fail if no stash to restore
     
     if [[ "$QUIET_MODE" == "true" ]]; then
         log_info "Running in quiet mode"
