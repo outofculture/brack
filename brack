@@ -400,19 +400,114 @@ cleanup_stash_on_error() {
     fi
 }
 
+# Merge base detection functions
+detect_main_branch() {
+    local main_branch_candidates=("main" "master" "origin/main" "origin/master")
+    
+    for branch in "${main_branch_candidates[@]}"; do
+        if git rev-parse --verify "$branch" >/dev/null 2>&1; then
+            if [[ "$QUIET_MODE" != "true" ]]; then
+                log_info "Detected main branch: $branch"
+            fi
+            echo "$branch"
+            return 0
+        fi
+    done
+    
+    # No main branch found
+    create_error_state "No main branch found. Tried: ${main_branch_candidates[*]}" "Main branch detection"
+    exit $EXIT_GENERAL_ERROR
+}
+
+calculate_merge_base() {
+    local main_branch="$1"
+    local merge_base
+    
+    if [[ -z "$main_branch" ]]; then
+        create_error_state "Main branch not provided for merge-base calculation" "Merge base calculation"
+        exit $EXIT_GENERAL_ERROR
+    fi
+    
+    merge_base=$(git merge-base HEAD "$main_branch" 2>/dev/null)
+    
+    if [[ $? -ne 0 ]]; then
+        create_error_state "Failed to calculate merge-base between HEAD and $main_branch" "Merge base calculation"
+        exit $EXIT_GENERAL_ERROR
+    fi
+    
+    if [[ -z "$merge_base" ]]; then
+        create_error_state "Merge-base calculation returned empty result for HEAD and $main_branch" "Merge base calculation"
+        exit $EXIT_GENERAL_ERROR
+    fi
+    
+    echo "$merge_base"
+}
+
+validate_merge_base() {
+    local merge_base="$1"
+    
+    if [[ -z "$merge_base" ]]; then
+        create_error_state "Merge-base commit hash not provided for validation" "Merge base validation"
+        exit $EXIT_GENERAL_ERROR
+    fi
+    
+    # Verify the commit exists and is valid
+    if ! git rev-parse --verify "$merge_base" >/dev/null 2>&1; then
+        create_error_state "Merge-base commit '$merge_base' does not exist or is invalid" "Merge base validation"
+        exit $EXIT_GENERAL_ERROR
+    fi
+    
+    # Check if merge-base is an ancestor of HEAD
+    if ! git merge-base --is-ancestor "$merge_base" HEAD 2>/dev/null; then
+        create_error_state "Merge-base commit '$merge_base' is not an ancestor of current HEAD" "Merge base validation"
+        exit $EXIT_GENERAL_ERROR
+    fi
+    
+    if [[ "$QUIET_MODE" != "true" ]]; then
+        log_info "Merge-base validated: $merge_base"
+    fi
+    
+    return 0
+}
+
+detect_and_validate_merge_base() {
+    local main_branch merge_base
+    
+    # Detect main branch
+    main_branch=$(detect_main_branch)
+    export MAIN_BRANCH="$main_branch"
+    
+    # Calculate merge-base
+    merge_base=$(calculate_merge_base "$main_branch")
+    export MERGE_BASE="$merge_base"
+    
+    # Validate merge-base
+    validate_merge_base "$merge_base"
+    
+    if [[ "$QUIET_MODE" != "true" ]]; then
+        log_success "Merge-base detection completed successfully"
+        log_info "Main branch: $MAIN_BRANCH"
+        log_info "Merge-base: $MERGE_BASE"
+    fi
+}
+
 # Placeholder for main functionality (to be implemented in later steps)
 main_workflow() {
     if [[ "$DRY_RUN" == "true" ]]; then
-        log_info "DRY RUN: Would stash changes, format files, and restore"
+        log_info "DRY RUN: Would detect merge-base, stash changes, format files, and restore"
+        detect_and_validate_merge_base  # Test merge-base detection in dry-run
         save_working_directory || true  # Test stashing in dry-run (don't fail if no changes)
         log_info "DRY RUN: Would format files here"
         restore_working_directory || true  # Test restoration in dry-run
         return 0
     fi
 
-    log_info "Main workflow not yet implemented - this is Step 4 foundation with git stashing"
+    log_info "Main workflow not yet implemented - this is Step 5 foundation with merge-base detection"
     log_info "Current branch: $CURRENT_BRANCH"
     log_info "Files to process: ${FILES[*]:-all Python files}"
+    
+    # Test the merge-base detection
+    detect_and_validate_merge_base
     
     # Test the stashing functionality
     save_working_directory || true  # Don't fail if no changes to stash

@@ -33,11 +33,11 @@ Implementation ready to begin following the 14-step plan in `plan.md`.
   - [x] Add stash conflict handling
   - [x] Test: Clean and dirty working directory scenarios
 
-- [ ] **Step 5**: Merge Base Detection
-  - [ ] Implement main branch detection (main/master/origin variants)
-  - [ ] Add merge-base calculation
-  - [ ] Add merge-base validation
-  - [ ] Test: Different repository configurations
+- [x] **Step 5**: Merge Base Detection
+  - [x] Implement main branch detection (main/master/origin variants)
+  - [x] Add merge-base calculation
+  - [x] Add merge-base validation
+  - [x] Test: Different repository configurations
 
 - [ ] **Step 6**: File Existence Validation
   - [ ] Add Python file validation
