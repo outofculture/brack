@@ -39,11 +39,11 @@ Implementation ready to begin following the 14-step plan in `plan.md`.
   - [x] Add merge-base validation
   - [x] Test: Different repository configurations
 
-- [ ] **Step 6**: File Existence Validation
-  - [ ] Add Python file validation
-  - [ ] Implement file existence checking at merge-base
-  - [ ] Create file categorization (existing vs new)
-  - [ ] Test: Mixed file scenarios
+- [x] **Step 6**: File Existence Validation
+  - [x] Add Python file validation
+  - [x] Implement file existence checking at merge-base
+  - [x] Create file categorization (existing vs new)
+  - [x] Test: Mixed file scenarios
 
 ### Phase 3: Formatting Operations (Steps 7-10)
 - [ ] **Step 7**: Branch Creation and Management

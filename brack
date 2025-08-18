@@ -491,23 +491,145 @@ detect_and_validate_merge_base() {
     fi
 }
 
+# File existence validation functions
+discover_python_files() {
+    local files=()
+    
+    if [[ ${#FILES[@]} -gt 0 ]]; then
+        # Use specified files
+        files=("${FILES[@]}")
+    else
+        # Discover all Python files in the repository
+        while IFS= read -r -d '' file; do
+            files+=("$file")
+        done < <(find . -name "*.py" -type f -print0 2>/dev/null)
+        
+        if [[ ${#files[@]} -eq 0 ]]; then
+            create_error_state "No Python files found in repository" "Python file discovery"
+            exit $EXIT_GENERAL_ERROR
+        fi
+    fi
+    
+    # Validate all files are Python files and exist
+    for file in "${files[@]}"; do
+        if [[ ! "$file" =~ \.py$ ]]; then
+            create_error_state "File '$file' is not a Python file (must have .py extension)" "Python file validation"
+            exit $EXIT_GENERAL_ERROR
+        fi
+        
+        if [[ ! -f "$file" ]]; then
+            create_error_state "Python file '$file' does not exist" "Python file validation"
+            exit $EXIT_GENERAL_ERROR
+        fi
+    done
+    
+    if [[ "$QUIET_MODE" != "true" ]]; then
+        log_info "Discovered ${#files[@]} Python file(s)"
+    fi
+    
+    # Return files as newline-separated string
+    printf '%s\n' "${files[@]}"
+}
+
+check_file_existence_at_merge_base() {
+    local file="$1"
+    local merge_base="$2"
+    
+    if [[ -z "$file" || -z "$merge_base" ]]; then
+        create_error_state "File or merge-base not provided for existence check" "File existence validation"
+        exit $EXIT_GENERAL_ERROR
+    fi
+    
+    # Use git show to check if file exists at merge-base
+    if git show "$merge_base:$file" >/dev/null 2>&1; then
+        return 0  # File exists at merge-base
+    else
+        return 1  # File does not exist at merge-base (new file)
+    fi
+}
+
+categorize_files() {
+    local merge_base="$1"
+    local existing_files=()
+    local new_files=()
+    
+    if [[ -z "$merge_base" ]]; then
+        create_error_state "Merge-base not provided for file categorization" "File categorization"
+        exit $EXIT_GENERAL_ERROR
+    fi
+    
+    # Get list of Python files
+    local python_files
+    mapfile -t python_files < <(discover_python_files)
+    
+    # Categorize each file
+    for file in "${python_files[@]}"; do
+        if check_file_existence_at_merge_base "$file" "$merge_base"; then
+            existing_files+=("$file")
+            if [[ "$QUIET_MODE" != "true" ]]; then
+                log_info "Existing file: $file"
+            fi
+        else
+            new_files+=("$file")
+            if [[ "$QUIET_MODE" != "true" ]]; then
+                log_info "New file: $file"
+            fi
+        fi
+    done
+    
+    # Export categorized files for use by other functions
+    export EXISTING_FILES=("${existing_files[@]}")
+    export NEW_FILES=("${new_files[@]}")
+    
+    if [[ "$QUIET_MODE" != "true" ]]; then
+        log_success "File categorization completed"
+        log_info "Existing files (${#existing_files[@]}): ${existing_files[*]:-none}"
+        log_info "New files (${#new_files[@]}): ${new_files[*]:-none}"
+    fi
+    
+    # Validate we have some files to process
+    if [[ ${#existing_files[@]} -eq 0 && ${#new_files[@]} -eq 0 ]]; then
+        create_error_state "No Python files found to process" "File categorization"
+        exit $EXIT_GENERAL_ERROR
+    fi
+}
+
+validate_and_categorize_files() {
+    local merge_base="$MERGE_BASE"
+    
+    if [[ -z "$merge_base" ]]; then
+        create_error_state "Merge-base not available for file validation" "File validation"
+        exit $EXIT_GENERAL_ERROR
+    fi
+    
+    categorize_files "$merge_base"
+    
+    if [[ "$QUIET_MODE" != "true" ]]; then
+        log_success "File validation and categorization completed successfully"
+    fi
+}
+
 # Placeholder for main functionality (to be implemented in later steps)
 main_workflow() {
     if [[ "$DRY_RUN" == "true" ]]; then
-        log_info "DRY RUN: Would detect merge-base, stash changes, format files, and restore"
+        log_info "DRY RUN: Would detect merge-base, validate files, stash changes, format files, and restore"
         detect_and_validate_merge_base  # Test merge-base detection in dry-run
+        validate_and_categorize_files   # Test file validation in dry-run
         save_working_directory || true  # Test stashing in dry-run (don't fail if no changes)
         log_info "DRY RUN: Would format files here"
         restore_working_directory || true  # Test restoration in dry-run
         return 0
     fi
 
-    log_info "Main workflow not yet implemented - this is Step 5 foundation with merge-base detection"
+    log_info "Main workflow not yet implemented - this is Step 6 foundation with file validation"
     log_info "Current branch: $CURRENT_BRANCH"
     log_info "Files to process: ${FILES[*]:-all Python files}"
     
     # Test the merge-base detection
     detect_and_validate_merge_base
+    
+    # Test the file validation and categorization
+    validate_and_categorize_files
     
     # Test the stashing functionality
     save_working_directory || true  # Don't fail if no changes to stash
