@@ -931,10 +931,191 @@ format_new_files() {
     format_files_with_black "${NEW_FILES[@]}"
 }
 
+# Commit formatting changes functions
+stage_formatted_files() {
+    local files_to_stage=("$@")
+    
+    if [[ ${#files_to_stage[@]} -eq 0 ]]; then
+        if [[ "$QUIET_MODE" != "true" ]]; then
+            log_info "No files to stage"
+        fi
+        return 0
+    fi
+    
+    if [[ "$QUIET_MODE" != "true" ]]; then
+        log_info "Staging ${#files_to_stage[@]} formatted file(s)..."
+    fi
+    
+    # Stage each file individually for better error handling
+    local staged_files=()
+    for file in "${files_to_stage[@]}"; do
+        if [[ ! -f "$file" ]]; then
+            log_warn "File '$file' not found, skipping staging"
+            continue
+        fi
+        
+        if git add "$file" >/dev/null 2>&1; then
+            staged_files+=("$file")
+            if [[ "$QUIET_MODE" != "true" ]]; then
+                log_info "Staged: $file"
+            fi
+        else
+            log_warn "Failed to stage file: $file"
+        fi
+    done
+    
+    if [[ ${#staged_files[@]} -eq 0 ]]; then
+        log_warn "No files were successfully staged"
+        return 1
+    fi
+    
+    if [[ "$QUIET_MODE" != "true" ]]; then
+        log_success "Staged ${#staged_files[@]} file(s)"
+    fi
+    
+    return 0
+}
+
+create_formatting_commit() {
+    local commit_message="$1"
+    local file_count="$2"
+    
+    if [[ -z "$commit_message" ]]; then
+        create_error_state "Commit message not provided for formatting commit" "Commit creation"
+        exit $EXIT_GENERAL_ERROR
+    fi
+    
+    # Check if there are actually staged changes
+    if ! git diff --cached --quiet >/dev/null 2>&1; then
+        if [[ "$QUIET_MODE" != "true" ]]; then
+            log_info "Creating formatting commit..."
+        fi
+        
+        if git commit -m "$commit_message" >/dev/null 2>&1; then
+            if [[ "$QUIET_MODE" != "true" ]]; then
+                log_success "Created formatting commit: $commit_message"
+            fi
+            return 0
+        else
+            create_error_state "Failed to create formatting commit" "Commit creation"
+            exit $EXIT_GENERAL_ERROR
+        fi
+    else
+        if [[ "$QUIET_MODE" != "true" ]]; then
+            log_info "No staged changes to commit"
+        fi
+        return 1  # No changes to commit
+    fi
+}
+
+commit_existing_files() {
+    if [[ ${#FORMATTED_FILES[@]} -eq 0 ]]; then
+        if [[ "$QUIET_MODE" != "true" ]]; then
+            log_info "No existing files were formatted, skipping commit"
+        fi
+        return 0
+    fi
+    
+    if [[ "$QUIET_MODE" != "true" ]]; then
+        log_info "Committing formatted existing files..."
+    fi
+    
+    # Stage the formatted files
+    if ! stage_formatted_files "${FORMATTED_FILES[@]}"; then
+        log_warn "Failed to stage formatted files, skipping commit"
+        return 1
+    fi
+    
+    # Create commit message
+    local file_count=${#FORMATTED_FILES[@]}
+    local commit_msg
+    if [[ $file_count -eq 1 ]]; then
+        commit_msg="style: apply black formatting to ${FORMATTED_FILES[0]}"
+    else
+        commit_msg="style: apply black formatting to $file_count files"
+    fi
+    
+    # Create the commit
+    if create_formatting_commit "$commit_msg" "$file_count"; then
+        if [[ "$QUIET_MODE" != "true" ]]; then
+            log_success "Committed formatting changes for existing files"
+        fi
+        return 0
+    else
+        if [[ "$QUIET_MODE" != "true" ]]; then
+            log_info "No formatting changes to commit for existing files"
+        fi
+        return 1
+    fi
+}
+
+commit_new_files() {
+    if [[ ${#FORMATTED_FILES[@]} -eq 0 ]]; then
+        if [[ "$QUIET_MODE" != "true" ]]; then
+            log_info "No new files were formatted, skipping commit"
+        fi
+        return 0
+    fi
+    
+    if [[ "$QUIET_MODE" != "true" ]]; then
+        log_info "Committing formatted new files..."
+    fi
+    
+    # Stage the formatted files
+    if ! stage_formatted_files "${FORMATTED_FILES[@]}"; then
+        log_warn "Failed to stage formatted new files, skipping commit"
+        return 1
+    fi
+    
+    # Create commit message
+    local file_count=${#FORMATTED_FILES[@]}
+    local commit_msg
+    if [[ $file_count -eq 1 ]]; then
+        commit_msg="style: apply black formatting to new file ${FORMATTED_FILES[0]}"
+    else
+        commit_msg="style: apply black formatting to $file_count new files"
+    fi
+    
+    # Create the commit
+    if create_formatting_commit "$commit_msg" "$file_count"; then
+        if [[ "$QUIET_MODE" != "true" ]]; then
+            log_success "Committed formatting changes for new files"
+        fi
+        return 0
+    else
+        if [[ "$QUIET_MODE" != "true" ]]; then
+            log_info "No formatting changes to commit for new files"
+        fi
+        return 1
+    fi
+}
+
+commit_formatting_changes() {
+    local current_branch
+    current_branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
+    
+    if [[ -z "$current_branch" ]]; then
+        create_error_state "Unable to determine current branch for commit operations" "Commit workflow"
+        exit $EXIT_GENERAL_ERROR
+    fi
+    
+    # Determine if we're on formatting branch or original branch
+    if [[ "$current_branch" == "$FORMATTING_BRANCH" ]]; then
+        # We're on formatting branch, commit existing files
+        commit_existing_files
+    elif [[ "$current_branch" == "$ORIGINAL_BRANCH" ]]; then
+        # We're on original branch, commit new files
+        commit_new_files
+    else
+        log_warn "Unexpected branch '$current_branch' during commit operations"
+        return 1
+    fi
+}
+
 # Placeholder for main functionality (to be implemented in later steps)
 main_workflow() {
     if [[ "$DRY_RUN" == "true" ]]; then
-        log_info "DRY RUN: Would check black, detect merge-base, validate files, create branch, stash changes, format files, and restore"
+        log_info "DRY RUN: Would check black, detect merge-base, validate files, create branch, stash changes, format files, commit changes, and restore"
         check_black_availability  # Test black availability in dry-run
         detect_and_validate_merge_base  # Test merge-base detection in dry-run
         validate_and_categorize_files   # Test file validation in dry-run
@@ -942,14 +1123,18 @@ main_workflow() {
         save_working_directory || true  # Test stashing in dry-run (don't fail if no changes)
         log_info "DRY RUN: Would format existing files in formatting branch"
         format_existing_files  # Test formatting existing files
+        log_info "DRY RUN: Would commit formatting changes for existing files"
+        commit_formatting_changes  # Test committing in formatting branch
         return_to_original_branch  # Return to original branch
         log_info "DRY RUN: Would format new files in current branch"
         format_new_files  # Test formatting new files
+        log_info "DRY RUN: Would commit formatting changes for new files"
+        commit_formatting_changes  # Test committing in original branch
         restore_working_directory || true  # Test restoration in dry-run
         return 0
     fi
 
-    log_info "Main workflow not yet implemented - this is Step 8 foundation with black formatting"
+    log_info "Main workflow not yet implemented - this is Step 9 foundation with commit functionality"
     log_info "Current branch: $CURRENT_BRANCH"
     log_info "Files to process: ${FILES[*]:-all Python files}"
     
@@ -971,11 +1156,17 @@ main_workflow() {
     # Format existing files in formatting branch
     format_existing_files
     
+    # Commit formatting changes for existing files
+    commit_formatting_changes
+    
     # Return to original branch to format new files
     return_to_original_branch
     
     # Format new files in current branch
     format_new_files
+    
+    # Commit formatting changes for new files
+    commit_formatting_changes
     
     # Restore stashed changes
     restore_working_directory || true  # Don't fail if no stash to restore
