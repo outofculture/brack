@@ -853,14 +853,19 @@ format_files_with_black() {
     # Run black on all files
     black_cmd_args+=("${files_to_format[@]}")
     
-    local black_output
     local black_exit_code
+    local black_output_file
+    black_output_file=$(mktemp)
     
-    if black_output=$("${black_cmd_args[@]}" 2>&1); then
+    if "${black_cmd_args[@]}" >"$black_output_file" 2>&1; then
         black_exit_code=0
     else
         black_exit_code=$?
     fi
+    
+    local black_output
+    black_output=$(cat "$black_output_file")
+    rm -f "$black_output_file"
     
     if [[ $black_exit_code -ne 0 ]]; then
         create_error_state "Black formatting failed (exit code $black_exit_code): $black_output" "Black formatting"
