@@ -14,11 +14,11 @@ Implementation ready to begin following the 14-step plan in `plan.md`.
   - [x] Add error handling and exit codes
   - [x] Test: Script validates arguments and shows help
 
-- [ ] **Step 2**: Git Repository Detection
-  - [ ] Add git repository validation
-  - [ ] Implement current branch detection
-  - [ ] Add detached HEAD checking
-  - [ ] Test: Script works in git repos, fails gracefully elsewhere
+- [x] **Step 2**: Git Repository Detection
+  - [x] Add git repository validation
+  - [x] Implement current branch detection
+  - [x] Add detached HEAD checking
+  - [x] Test: Script works in git repos, fails gracefully elsewhere
 
 - [ ] **Step 3**: Error State Management
   - [ ] Implement error file checking on startup

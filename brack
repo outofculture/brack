@@ -170,6 +170,54 @@ cleanup_error_state() {
     fi
 }
 
+# Git repository detection functions
+validate_git_repository() {
+    if ! git rev-parse --git-dir >/dev/null 2>&1; then
+        error_exit "Not in a git repository. Please run this tool from within a git repository." $EXIT_NOT_GIT_REPO
+    fi
+    
+    if [[ "$QUIET_MODE" != "true" ]]; then
+        log_info "Git repository detected"
+    fi
+}
+
+get_current_branch() {
+    local branch_name
+    branch_name=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
+    
+    if [[ $? -ne 0 ]]; then
+        error_exit "Failed to determine current branch" $EXIT_GENERAL_ERROR
+    fi
+    
+    if [[ -z "$branch_name" ]]; then
+        error_exit "Unable to determine current branch name" $EXIT_GENERAL_ERROR
+    fi
+    
+    echo "$branch_name"
+}
+
+validate_not_detached_head() {
+    local current_branch
+    current_branch=$(get_current_branch)
+    
+    if [[ "$current_branch" == "HEAD" ]]; then
+        error_exit "Cannot run on detached HEAD. Please checkout a branch first." $EXIT_GENERAL_ERROR
+    fi
+    
+    if [[ "$QUIET_MODE" != "true" ]]; then
+        log_info "Current branch: $current_branch"
+    fi
+    
+    # Export for use by other functions
+    export CURRENT_BRANCH="$current_branch"
+}
+
+# Git repository validation workflow
+validate_git_environment() {
+    validate_git_repository
+    validate_not_detached_head
+}
+
 # Placeholder for main functionality (to be implemented in later steps)
 main_workflow() {
     if [[ "$DRY_RUN" == "true" ]]; then
@@ -177,7 +225,8 @@ main_workflow() {
         return 0
     fi
 
-    log_info "Main workflow not yet implemented - this is Step 1 foundation only"
+    log_info "Main workflow not yet implemented - this is Step 2 foundation with git detection"
+    log_info "Current branch: $CURRENT_BRANCH"
     log_info "Files to process: ${FILES[*]:-all Python files}"
     
     if [[ "$QUIET_MODE" == "true" ]]; then
@@ -200,6 +249,9 @@ main() {
     if [[ -f "$ERROR_FILE" ]]; then
         error_exit "Previous error state detected. Run with --cleanup to resolve." $EXIT_ERROR_STATE
     fi
+
+    # Validate git environment (Step 2)
+    validate_git_environment
 
     # Run main workflow
     main_workflow
