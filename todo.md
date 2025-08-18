@@ -58,11 +58,11 @@ Implementation ready to begin following the 14-step plan in `plan.md`.
   - [x] Add formatting change detection
   - [x] Test: Valid files, syntax errors, no black installed
 
-- [ ] **Step 9**: Commit Formatting Changes
-  - [ ] Add file staging for formatted files
-  - [ ] Implement commit creation with standard message
-  - [ ] Handle no-changes scenarios
-  - [ ] Test: Changes made, no changes made
+- [x] **Step 9**: Commit Formatting Changes
+  - [x] Add file staging for formatted files
+  - [x] Implement commit creation with standard message
+  - [x] Handle no-changes scenarios
+  - [x] Test: Changes made, no changes made
 
 - [ ] **Step 10**: Branch Switching and Merging
   - [ ] Add return to original branch
