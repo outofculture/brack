@@ -274,16 +274,150 @@ validate_git_environment() {
     validate_not_detached_head
 }
 
+# Git stashing functions
+detect_working_directory_changes() {
+    local status_output
+    status_output=$(git status --porcelain 2>/dev/null)
+    
+    if [[ $? -ne 0 ]]; then
+        create_error_state "Failed to check git status" "Working directory detection"
+        exit $EXIT_GENERAL_ERROR
+    fi
+    
+    if [[ -n "$status_output" ]]; then
+        if [[ "$QUIET_MODE" != "true" ]]; then
+            log_info "Working directory has uncommitted changes"
+        fi
+        return 0  # Changes detected
+    else
+        if [[ "$QUIET_MODE" != "true" ]]; then
+            log_info "Working directory is clean"
+        fi
+        return 1  # No changes
+    fi
+}
+
+save_working_directory() {
+    local stash_message="brack-auto-stash-$(date +%Y%m%d-%H%M%S)"
+    
+    if detect_working_directory_changes; then
+        if [[ "$QUIET_MODE" != "true" ]]; then
+            log_info "Stashing working directory changes..."
+        fi
+        
+        if ! git stash push -m "$stash_message" >/dev/null 2>&1; then
+            create_error_state "Failed to stash working directory changes" "Git stashing"
+            exit $EXIT_GENERAL_ERROR
+        fi
+        
+        # Verify stash was created by checking if working directory is now clean
+        if detect_working_directory_changes; then
+            create_error_state "Stash operation failed - working directory still has changes" "Git stashing verification"
+            exit $EXIT_GENERAL_ERROR
+        fi
+        
+        # Export stash info for later restoration
+        export STASH_CREATED="true"
+        export STASH_MESSAGE="$stash_message"
+        
+        if [[ "$QUIET_MODE" != "true" ]]; then
+            log_success "Working directory stashed successfully"
+        fi
+        return 0
+    else
+        # No changes to stash
+        export STASH_CREATED="false"
+        return 1
+    fi
+}
+
+restore_working_directory() {
+    if [[ "$STASH_CREATED" == "true" ]]; then
+        if [[ "$QUIET_MODE" != "true" ]]; then
+            log_info "Restoring stashed changes..."
+        fi
+        
+        # Check if our stash still exists
+        if ! git stash list | grep -q "$STASH_MESSAGE"; then
+            log_warn "Expected stash '$STASH_MESSAGE' not found in stash list"
+            return 1
+        fi
+        
+        # Pop the stash
+        if ! git stash pop >/dev/null 2>&1; then
+            log_error "Failed to restore stashed changes - you may have merge conflicts"
+            log_error "Manual recovery: git stash list (look for '$STASH_MESSAGE')"
+            log_error "Then: git stash apply stash@{N} (where N is the stash index)"
+            create_error_state "Failed to restore stashed changes from '$STASH_MESSAGE'" "Git stash restoration"
+            exit $EXIT_GENERAL_ERROR
+        fi
+        
+        # Verify stash was applied
+        if ! detect_working_directory_changes; then
+            log_warn "Stash restored but no changes detected - this may be normal if stash only had staged changes"
+        fi
+        
+        if [[ "$QUIET_MODE" != "true" ]]; then
+            log_success "Working directory changes restored successfully"
+        fi
+        
+        # Clear stash flags
+        export STASH_CREATED="false"
+        export STASH_MESSAGE=""
+        return 0
+    else
+        # No stash to restore
+        if [[ "$QUIET_MODE" != "true" ]]; then
+            log_info "No stash to restore"
+        fi
+        return 1
+    fi
+}
+
+cleanup_stash_on_error() {
+    if [[ "$STASH_CREATED" == "true" && -n "$STASH_MESSAGE" ]]; then
+        log_error "Emergency cleanup: attempting to restore stashed changes..."
+        
+        # Try to restore the stash
+        if git stash list | grep -q "$STASH_MESSAGE"; then
+            if git stash pop >/dev/null 2>&1; then
+                log_success "Successfully restored stashed changes during cleanup"
+                export STASH_CREATED="false"
+                export STASH_MESSAGE=""
+            else
+                log_error "Failed to restore stash during cleanup"
+                log_error "MANUAL RECOVERY REQUIRED:"
+                log_error "  1. Check stash list: git stash list"
+                log_error "  2. Find stash: $STASH_MESSAGE"
+                log_error "  3. Apply manually: git stash apply stash@{N}"
+                create_error_state "Failed to restore stash '$STASH_MESSAGE' during error cleanup" "Emergency stash cleanup"
+            fi
+        else
+            log_warn "Stash '$STASH_MESSAGE' not found during cleanup - may have been already applied"
+            export STASH_CREATED="false"
+            export STASH_MESSAGE=""
+        fi
+    fi
+}
+
 # Placeholder for main functionality (to be implemented in later steps)
 main_workflow() {
     if [[ "$DRY_RUN" == "true" ]]; then
+        log_info "DRY RUN: Would stash changes, format files, and restore"
+        save_working_directory  # Test stashing in dry-run
         log_info "DRY RUN: Would format files here"
+        restore_working_directory  # Test restoration in dry-run
         return 0
     fi
 
-    log_info "Main workflow not yet implemented - this is Step 2 foundation with git detection"
+    log_info "Main workflow not yet implemented - this is Step 4 foundation with git stashing"
     log_info "Current branch: $CURRENT_BRANCH"
     log_info "Files to process: ${FILES[*]:-all Python files}"
+    
+    # Test the stashing functionality
+    save_working_directory
+    log_info "This is where formatting would happen in later steps"
+    restore_working_directory
     
     if [[ "$QUIET_MODE" == "true" ]]; then
         log_info "Running in quiet mode"
