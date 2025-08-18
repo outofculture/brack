@@ -414,6 +414,56 @@ cleanup_stash_on_error() {
     fi
 }
 
+# Comprehensive error cleanup function
+emergency_cleanup() {
+    local error_context="${1:-Unknown error context}"
+    
+    log_error "Performing emergency cleanup due to: $error_context"
+    
+    # 1. Try to restore stashed changes
+    cleanup_stash_on_error
+    
+    # 2. Try to return to original branch
+    if [[ -n "$ORIGINAL_BRANCH" ]]; then
+        local current_branch
+        current_branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
+        
+        if [[ "$current_branch" != "$ORIGINAL_BRANCH" ]]; then
+            log_error "Attempting to return to original branch: $ORIGINAL_BRANCH"
+            
+            # If we're in a merge state, try to abort first
+            if [[ -f ".git/MERGE_HEAD" ]]; then
+                log_error "Aborting ongoing merge..."
+                git merge --abort >/dev/null 2>&1 || true
+            fi
+            
+            if git checkout "$ORIGINAL_BRANCH" >/dev/null 2>&1; then
+                log_success "Returned to original branch during cleanup"
+            else
+                log_error "Failed to return to original branch during cleanup"
+                log_error "Manual recovery: git checkout $ORIGINAL_BRANCH"
+            fi
+        fi
+    fi
+    
+    # 3. Provide guidance for formatting branch cleanup
+    if [[ -n "$FORMATTING_BRANCH" ]]; then
+        log_error "Formatting branch '$FORMATTING_BRANCH' may need manual cleanup"
+        log_error "To clean up: git branch -D $FORMATTING_BRANCH"
+    fi
+    
+    log_error "Emergency cleanup completed. Check the error state file for details."
+}
+
+# Add signal handlers for emergency cleanup
+setup_signal_handlers() {
+    trap 'emergency_cleanup "Script interrupted"; exit 130' INT TERM
+}
+
+cleanup_signal_handlers() {
+    trap - INT TERM
+}
+
 # Merge base detection functions
 detect_main_branch() {
     local main_branch_candidates=("main" "master" "origin/main" "origin/master")
@@ -785,6 +835,180 @@ create_or_reuse_formatting_branch() {
     fi
 }
 
+# Branch merging functions
+merge_formatting_changes() {
+    local formatting_branch="$FORMATTING_BRANCH"
+    local original_branch="$ORIGINAL_BRANCH"
+    
+    if [[ -z "$formatting_branch" || -z "$original_branch" ]]; then
+        create_error_state "Formatting branch or original branch not available for merge" "Branch merging"
+        exit $EXIT_GENERAL_ERROR
+    fi
+    
+    # Ensure we're on the original branch
+    local current_branch
+    current_branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
+    
+    if [[ "$current_branch" != "$original_branch" ]]; then
+        if [[ "$QUIET_MODE" != "true" ]]; then
+            log_info "Switching to original branch for merge: $original_branch"
+        fi
+        
+        if ! git checkout "$original_branch" >/dev/null 2>&1; then
+            create_error_state "Failed to switch to original branch '$original_branch' for merge" "Branch merging"
+            exit $EXIT_GENERAL_ERROR
+        fi
+    fi
+    
+    if [[ "$QUIET_MODE" != "true" ]]; then
+        log_info "Merging formatting changes from $formatting_branch into $original_branch"
+    fi
+    
+    # Attempt the merge
+    local merge_output_file
+    merge_output_file=$(mktemp)
+    
+    if git merge --no-ff -m "Merge formatting changes from $formatting_branch" "$formatting_branch" >"$merge_output_file" 2>&1; then
+        # Merge succeeded
+        if [[ "$QUIET_MODE" != "true" ]]; then
+            log_success "Successfully merged formatting changes"
+        fi
+        rm -f "$merge_output_file"
+        return 0
+    else
+        # Merge failed - likely due to conflicts
+        local merge_output
+        merge_output=$(cat "$merge_output_file")
+        rm -f "$merge_output_file"
+        
+        log_error "Merge failed with conflicts or other issues"
+        log_error "Git merge output: $merge_output"
+        
+        # Check if we're in a merge state
+        if [[ -f ".git/MERGE_HEAD" ]]; then
+            log_error "Repository is in merge state with conflicts"
+            handle_merge_conflicts
+        else
+            create_error_state "Merge failed: $merge_output" "Branch merging"
+            exit $EXIT_GENERAL_ERROR
+        fi
+        
+        return 1
+    fi
+}
+
+handle_merge_conflicts() {
+    log_error "Merge conflicts detected. Attempting automatic cleanup..."
+    
+    # Abort the merge to return to clean state
+    if git merge --abort >/dev/null 2>&1; then
+        log_info "Merge aborted successfully, repository returned to clean state"
+        
+        # Try to restore stashed changes since merge failed
+        cleanup_stash_on_error
+        
+        create_error_state "Merge conflicts detected between formatting changes and current branch. Manual resolution required." "Merge conflicts"
+        exit $EXIT_GENERAL_ERROR
+    else
+        log_error "Failed to abort merge - repository may be in inconsistent state"
+        log_error "MANUAL RECOVERY REQUIRED:"
+        log_error "  1. Check repository status: git status"
+        log_error "  2. Resolve conflicts manually or abort merge: git merge --abort"
+        log_error "  3. Restore stashed changes if needed: git stash list"
+        log_error "  4. Clean up formatting branch: git branch -D $FORMATTING_BRANCH"
+        log_error "  5. Run: brack --cleanup"
+        
+        create_error_state "Failed to abort merge after conflicts - repository in inconsistent state" "Merge conflict cleanup"
+        exit $EXIT_GENERAL_ERROR
+    fi
+}
+
+validate_merge_success() {
+    local formatting_branch="$FORMATTING_BRANCH"
+    
+    if [[ -z "$formatting_branch" ]]; then
+        log_warn "Formatting branch not available for merge validation"
+        return 1
+    fi
+    
+    # Check that we're not in a merge state
+    if [[ -f ".git/MERGE_HEAD" ]]; then
+        log_error "Repository still in merge state after supposed successful merge"
+        return 1
+    fi
+    
+    # Verify the merge commit exists
+    if ! git log --oneline -1 | grep -q "Merge formatting changes"; then
+        log_warn "Expected merge commit not found in recent history"
+        return 1
+    fi
+    
+    if [[ "$QUIET_MODE" != "true" ]]; then
+        log_success "Merge validation completed successfully"
+    fi
+    
+    return 0
+}
+
+cleanup_after_successful_merge() {
+    local formatting_branch="$FORMATTING_BRANCH"
+    
+    if [[ -z "$formatting_branch" ]]; then
+        if [[ "$QUIET_MODE" != "true" ]]; then
+            log_info "No formatting branch to clean up after merge"
+        fi
+        return 0
+    fi
+    
+    # Delete the formatting branch since merge was successful
+    if check_formatting_branch_exists "$formatting_branch"; then
+        if [[ "$QUIET_MODE" != "true" ]]; then
+            log_info "Cleaning up formatting branch after successful merge: $formatting_branch"
+        fi
+        
+        if git branch -d "$formatting_branch" >/dev/null 2>&1; then
+            if [[ "$QUIET_MODE" != "true" ]]; then
+                log_success "Cleaned up formatting branch: $formatting_branch"
+            fi
+        else
+            # Try force delete if normal delete failed
+            if git branch -D "$formatting_branch" >/dev/null 2>&1; then
+                log_warn "Force deleted formatting branch: $formatting_branch"
+            else
+                log_warn "Failed to delete formatting branch '$formatting_branch' - manual cleanup required"
+                log_warn "Manual cleanup: git branch -D $formatting_branch"
+            fi
+        fi
+    fi
+    
+    # Clear formatting branch variable
+    export FORMATTING_BRANCH=""
+}
+
+merge_and_cleanup_formatting_branch() {
+    if [[ -z "$FORMATTING_BRANCH" ]]; then
+        if [[ "$QUIET_MODE" != "true" ]]; then
+            log_info "No formatting branch to merge"
+        fi
+        return 0
+    fi
+    
+    # Attempt the merge
+    if merge_formatting_changes; then
+        # Merge succeeded, validate and cleanup
+        if validate_merge_success; then
+            cleanup_after_successful_merge
+            return 0
+        else
+            log_warn "Merge completed but validation failed"
+            return 1
+        fi
+    else
+        # Merge failed - error handling already done in merge_formatting_changes
+        return 1
+    fi
+}
+
 # Black formatting integration functions
 check_black_availability() {
     if command -v black >/dev/null 2>&1; then
@@ -1115,7 +1339,7 @@ commit_formatting_changes() {
 # Placeholder for main functionality (to be implemented in later steps)
 main_workflow() {
     if [[ "$DRY_RUN" == "true" ]]; then
-        log_info "DRY RUN: Would check black, detect merge-base, validate files, create branch, stash changes, format files, commit changes, and restore"
+        log_info "DRY RUN: Would check black, detect merge-base, validate files, create branch, stash changes, format files, commit changes, merge, and restore"
         check_black_availability  # Test black availability in dry-run
         detect_and_validate_merge_base  # Test merge-base detection in dry-run
         validate_and_categorize_files   # Test file validation in dry-run
@@ -1130,27 +1354,29 @@ main_workflow() {
         format_new_files  # Test formatting new files
         log_info "DRY RUN: Would commit formatting changes for new files"
         commit_formatting_changes  # Test committing in original branch
+        log_info "DRY RUN: Would merge formatting changes back to original branch"
+        log_info "DRY RUN: Would clean up formatting branch after successful merge"
         restore_working_directory || true  # Test restoration in dry-run
         return 0
     fi
 
-    log_info "Main workflow not yet implemented - this is Step 9 foundation with commit functionality"
+    log_info "Main workflow - Step 10: Branch switching and merging implementation"
     log_info "Current branch: $CURRENT_BRANCH"
     log_info "Files to process: ${FILES[*]:-all Python files}"
     
     # Check black availability
     check_black_availability
     
-    # Test the merge-base detection
+    # Detect the merge-base and main branch
     detect_and_validate_merge_base
     
-    # Test the file validation and categorization
+    # Validate and categorize files
     validate_and_categorize_files
     
-    # Test the branch creation/reuse
+    # Create or reuse formatting branch
     create_or_reuse_formatting_branch
     
-    # Test the stashing functionality
+    # Save working directory changes
     save_working_directory || true  # Don't fail if no changes to stash
     
     # Format existing files in formatting branch
@@ -1168,16 +1394,22 @@ main_workflow() {
     # Commit formatting changes for new files
     commit_formatting_changes
     
+    # Merge formatting changes back to original branch
+    merge_and_cleanup_formatting_branch
+    
     # Restore stashed changes
     restore_working_directory || true  # Don't fail if no stash to restore
     
-    if [[ "$QUIET_MODE" == "true" ]]; then
-        log_info "Running in quiet mode"
+    if [[ "$QUIET_MODE" != "true" ]]; then
+        log_success "Workflow completed successfully"
     fi
 }
 
 # Main entry point
 main() {
+    # Setup signal handlers for emergency cleanup
+    setup_signal_handlers
+    
     # Parse command line arguments
     parse_arguments "$@"
 
@@ -1195,6 +1427,9 @@ main() {
 
     # Run main workflow
     main_workflow
+    
+    # Clean up signal handlers
+    cleanup_signal_handlers
 }
 
 # Run main function with all arguments
