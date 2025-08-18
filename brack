@@ -404,9 +404,9 @@ cleanup_stash_on_error() {
 main_workflow() {
     if [[ "$DRY_RUN" == "true" ]]; then
         log_info "DRY RUN: Would stash changes, format files, and restore"
-        save_working_directory  # Test stashing in dry-run
+        save_working_directory || true  # Test stashing in dry-run (don't fail if no changes)
         log_info "DRY RUN: Would format files here"
-        restore_working_directory  # Test restoration in dry-run
+        restore_working_directory || true  # Test restoration in dry-run
         return 0
     fi
 
@@ -415,9 +415,9 @@ main_workflow() {
     log_info "Files to process: ${FILES[*]:-all Python files}"
     
     # Test the stashing functionality
-    save_working_directory
+    save_working_directory || true  # Don't fail if no changes to stash
     log_info "This is where formatting would happen in later steps"
-    restore_working_directory
+    restore_working_directory || true  # Don't fail if no stash to restore
     
     if [[ "$QUIET_MODE" == "true" ]]; then
         log_info "Running in quiet mode"
