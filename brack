@@ -609,19 +609,183 @@ validate_and_categorize_files() {
     fi
 }
 
+# Branch creation and management functions
+generate_formatting_branch_name() {
+    local current_branch="$CURRENT_BRANCH"
+    
+    if [[ -z "$current_branch" ]]; then
+        create_error_state "Current branch not available for formatting branch name generation" "Branch naming"
+        exit $EXIT_GENERAL_ERROR
+    fi
+    
+    local formatting_branch="${current_branch}-auto-black-formatting"
+    echo "$formatting_branch"
+}
+
+check_formatting_branch_exists() {
+    local branch_name="$1"
+    
+    if [[ -z "$branch_name" ]]; then
+        create_error_state "Branch name not provided for existence check" "Branch existence check"
+        exit $EXIT_GENERAL_ERROR
+    fi
+    
+    if git rev-parse --verify "$branch_name" >/dev/null 2>&1; then
+        return 0  # Branch exists
+    else
+        return 1  # Branch does not exist
+    fi
+}
+
+create_formatting_branch() {
+    local branch_name="$1"
+    local merge_base="$2"
+    
+    if [[ -z "$branch_name" || -z "$merge_base" ]]; then
+        create_error_state "Branch name or merge-base not provided for branch creation" "Branch creation"
+        exit $EXIT_GENERAL_ERROR
+    fi
+    
+    if [[ "$QUIET_MODE" != "true" ]]; then
+        log_info "Creating formatting branch: $branch_name"
+    fi
+    
+    if ! git checkout -b "$branch_name" "$merge_base" >/dev/null 2>&1; then
+        create_error_state "Failed to create formatting branch '$branch_name' from merge-base '$merge_base'" "Branch creation"
+        exit $EXIT_GENERAL_ERROR
+    fi
+    
+    if [[ "$QUIET_MODE" != "true" ]]; then
+        log_success "Created formatting branch: $branch_name"
+    fi
+}
+
+reuse_formatting_branch() {
+    local branch_name="$1"
+    
+    if [[ -z "$branch_name" ]]; then
+        create_error_state "Branch name not provided for reuse" "Branch reuse"
+        exit $EXIT_GENERAL_ERROR
+    fi
+    
+    if [[ "$QUIET_MODE" != "true" ]]; then
+        log_info "Reusing existing formatting branch: $branch_name"
+    fi
+    
+    if ! git checkout "$branch_name" >/dev/null 2>&1; then
+        create_error_state "Failed to checkout existing formatting branch '$branch_name'" "Branch reuse"
+        exit $EXIT_GENERAL_ERROR
+    fi
+    
+    if [[ "$QUIET_MODE" != "true" ]]; then
+        log_success "Switched to existing formatting branch: $branch_name"
+    fi
+}
+
+return_to_original_branch() {
+    local original_branch="$ORIGINAL_BRANCH"
+    
+    if [[ -z "$original_branch" ]]; then
+        log_warn "Original branch not available for restoration"
+        return 1
+    fi
+    
+    if [[ "$QUIET_MODE" != "true" ]]; then
+        log_info "Returning to original branch: $original_branch"
+    fi
+    
+    if ! git checkout "$original_branch" >/dev/null 2>&1; then
+        log_error "Failed to return to original branch '$original_branch'"
+        create_error_state "Failed to return to original branch '$original_branch'" "Branch restoration"
+        exit $EXIT_GENERAL_ERROR
+    fi
+    
+    if [[ "$QUIET_MODE" != "true" ]]; then
+        log_success "Returned to original branch: $original_branch"
+    fi
+}
+
+cleanup_formatting_branch() {
+    local formatting_branch="$FORMATTING_BRANCH"
+    
+    if [[ -z "$formatting_branch" ]]; then
+        if [[ "$QUIET_MODE" != "true" ]]; then
+            log_info "No formatting branch to clean up"
+        fi
+        return 0
+    fi
+    
+    # First return to original branch
+    return_to_original_branch
+    
+    # Check if formatting branch exists and delete it
+    if check_formatting_branch_exists "$formatting_branch"; then
+        if [[ "$QUIET_MODE" != "true" ]]; then
+            log_info "Cleaning up formatting branch: $formatting_branch"
+        fi
+        
+        if git branch -D "$formatting_branch" >/dev/null 2>&1; then
+            if [[ "$QUIET_MODE" != "true" ]]; then
+                log_success "Cleaned up formatting branch: $formatting_branch"
+            fi
+        else
+            log_error "Failed to delete formatting branch '$formatting_branch'"
+            log_error "Manual cleanup required: git branch -D $formatting_branch"
+        fi
+    fi
+    
+    # Clear formatting branch variable
+    export FORMATTING_BRANCH=""
+}
+
+create_or_reuse_formatting_branch() {
+    local merge_base="$MERGE_BASE"
+    local current_branch="$CURRENT_BRANCH"
+    
+    if [[ -z "$merge_base" || -z "$current_branch" ]]; then
+        create_error_state "Merge-base or current branch not available for formatting branch creation" "Branch management"
+        exit $EXIT_GENERAL_ERROR
+    fi
+    
+    # Store original branch for cleanup
+    export ORIGINAL_BRANCH="$current_branch"
+    
+    # Generate formatting branch name
+    local formatting_branch
+    formatting_branch=$(generate_formatting_branch_name)
+    export FORMATTING_BRANCH="$formatting_branch"
+    
+    if [[ "$QUIET_MODE" != "true" ]]; then
+        log_info "Formatting branch: $formatting_branch"
+    fi
+    
+    # Check if formatting branch already exists
+    if check_formatting_branch_exists "$formatting_branch"; then
+        reuse_formatting_branch "$formatting_branch"
+    else
+        create_formatting_branch "$formatting_branch" "$merge_base"
+    fi
+    
+    if [[ "$QUIET_MODE" != "true" ]]; then
+        log_success "Formatting branch setup completed"
+    fi
+}
+
 # Placeholder for main functionality (to be implemented in later steps)
 main_workflow() {
     if [[ "$DRY_RUN" == "true" ]]; then
-        log_info "DRY RUN: Would detect merge-base, validate files, stash changes, format files, and restore"
+        log_info "DRY RUN: Would detect merge-base, validate files, create branch, stash changes, format files, and restore"
         detect_and_validate_merge_base  # Test merge-base detection in dry-run
         validate_and_categorize_files   # Test file validation in dry-run
+        create_or_reuse_formatting_branch  # Test branch creation in dry-run
         save_working_directory || true  # Test stashing in dry-run (don't fail if no changes)
         log_info "DRY RUN: Would format files here"
         restore_working_directory || true  # Test restoration in dry-run
+        return_to_original_branch  # Test returning to original branch
         return 0
     fi
 
-    log_info "Main workflow not yet implemented - this is Step 6 foundation with file validation"
+    log_info "Main workflow not yet implemented - this is Step 7 foundation with branch management"
     log_info "Current branch: $CURRENT_BRANCH"
     log_info "Files to process: ${FILES[*]:-all Python files}"
     
@@ -631,10 +795,16 @@ main_workflow() {
     # Test the file validation and categorization
     validate_and_categorize_files
     
+    # Test the branch creation/reuse
+    create_or_reuse_formatting_branch
+    
     # Test the stashing functionality
     save_working_directory || true  # Don't fail if no changes to stash
     log_info "This is where formatting would happen in later steps"
     restore_working_directory || true  # Don't fail if no stash to restore
+    
+    # Return to original branch
+    return_to_original_branch
     
     if [[ "$QUIET_MODE" == "true" ]]; then
         log_info "Running in quiet mode"
