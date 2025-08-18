@@ -52,11 +52,11 @@ Implementation ready to begin following the 14-step plan in `plan.md`.
   - [x] Add branch cleanup on errors
   - [x] Test: New and existing formatting branches
 
-- [ ] **Step 8**: Black Formatting Integration
-  - [ ] Add black availability checking
-  - [ ] Implement file formatting with error capture
-  - [ ] Add formatting change detection
-  - [ ] Test: Valid files, syntax errors, no black installed
+- [x] **Step 8**: Black Formatting Integration
+  - [x] Add black availability checking
+  - [x] Implement file formatting with error capture
+  - [x] Add formatting change detection
+  - [x] Test: Valid files, syntax errors, no black installed
 
 - [ ] **Step 9**: Commit Formatting Changes
   - [ ] Add file staging for formatted files
