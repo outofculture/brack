@@ -27,11 +27,11 @@ Implementation ready to begin following the 14-step plan in `plan.md`.
   - [x] Test: Manual error file creation/cleanup
 
 ### Phase 2: Git Core Operations (Steps 4-6)
-- [ ] **Step 4**: Git Stashing Implementation
-  - [ ] Add working directory change detection
-  - [ ] Implement safe stash save/pop
-  - [ ] Add stash conflict handling
-  - [ ] Test: Clean and dirty working directory scenarios
+- [x] **Step 4**: Git Stashing Implementation
+  - [x] Add working directory change detection
+  - [x] Implement safe stash save/pop
+  - [x] Add stash conflict handling
+  - [x] Test: Clean and dirty working directory scenarios
 
 - [ ] **Step 5**: Merge Base Detection
   - [ ] Implement main branch detection (main/master/origin variants)

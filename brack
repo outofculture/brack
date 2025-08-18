@@ -305,7 +305,7 @@ save_working_directory() {
             log_info "Stashing working directory changes..."
         fi
         
-        if ! git stash push -m "$stash_message" >/dev/null 2>&1; then
+        if ! git stash push -u -m "$stash_message" >/dev/null 2>&1; then
             create_error_state "Failed to stash working directory changes" "Git stashing"
             exit $EXIT_GENERAL_ERROR
         fi
