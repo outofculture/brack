@@ -1496,7 +1496,8 @@ EOF
         pr_body+=$'\n'
     fi
     
-    pr_body+=$(cat << EOF
+    read -r -d '' pr_body << EOF
+$pr_body
 ## Review Notes
 
 - ✅ These are **formatting-only changes** with no functional modifications
@@ -1512,8 +1513,7 @@ This formatting PR can be safely merged into \`${original_branch}\` and then the
 
 🤖 *Generated automatically by [brack](https://github.com/outofculture/brack) - Apply black formatting with clean diffs*
 EOF
-)
-    
+
     echo "$pr_body"
 }
 
