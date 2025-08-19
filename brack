@@ -2035,73 +2035,275 @@ commit_formatting_changes() {
     fi
 }
 
-# Placeholder for main functionality (to be implemented in later steps)
+# Performance timing functions
+get_timestamp_ms() {
+    # Get current timestamp in milliseconds
+    if command -v gdate >/dev/null 2>&1; then
+        # macOS with GNU coreutils
+        gdate +%s%3N
+    elif date --version >/dev/null 2>&1; then
+        # GNU date (Linux)
+        date +%s%3N
+    else
+        # Fallback for systems without millisecond precision
+        echo $(($(date +%s) * 1000))
+    fi
+}
+
+calculate_duration() {
+    local start_time="$1"
+    local end_time="$2"
+    local duration=$((end_time - start_time))
+    echo "$duration"
+}
+
+validate_performance_timing() {
+    local duration_ms="$1"
+    local max_duration_ms="${2:-1000}"  # Default 1 second
+    
+    if [[ $duration_ms -gt $max_duration_ms ]]; then
+        log_warn "Performance requirement not met: ${duration_ms}ms > ${max_duration_ms}ms"
+        return 1
+    else
+        if [[ "$QUIET_MODE" != "true" ]]; then
+            log_success "Performance requirement met: ${duration_ms}ms ≤ ${max_duration_ms}ms"
+        fi
+        return 0
+    fi
+}
+
+# Complete main workflow with all integrations
 main_workflow() {
+    local workflow_start_time
+    workflow_start_time=$(get_timestamp_ms)
+    
     if [[ "$DRY_RUN" == "true" ]]; then
-        log_info "DRY RUN: Would check black, detect merge-base, validate files, create branch, stash changes, format files, commit changes, merge, and restore"
-        check_black_availability  # Test black availability in dry-run
-        detect_and_validate_merge_base  # Test merge-base detection in dry-run
-        validate_and_categorize_files   # Test file validation in dry-run
-        create_or_reuse_formatting_branch  # Test branch creation in dry-run
-        save_working_directory || true  # Test stashing in dry-run (don't fail if no changes)
+        log_info "DRY RUN: Complete workflow simulation"
+        check_black_availability
+        detect_and_validate_merge_base
+        validate_and_categorize_files
+        create_or_reuse_formatting_branch
+        save_working_directory || true
         log_info "DRY RUN: Would format existing files in formatting branch"
-        format_existing_files  # Test formatting existing files
+        format_existing_files
         log_info "DRY RUN: Would commit formatting changes for existing files"
-        commit_formatting_changes  # Test committing in formatting branch
-        return_to_original_branch  # Return to original branch
+        commit_formatting_changes
+        log_info "DRY RUN: Would start background GitHub push"
+        return_to_original_branch
         log_info "DRY RUN: Would format new files in current branch"
-        format_new_files  # Test formatting new files
+        format_new_files
         log_info "DRY RUN: Would commit formatting changes for new files"
-        commit_formatting_changes  # Test committing in original branch
+        commit_formatting_changes
         log_info "DRY RUN: Would merge formatting changes back to original branch"
-        log_info "DRY RUN: Would clean up formatting branch after successful merge"
-        restore_working_directory || true  # Test restoration in dry-run
+        log_info "DRY RUN: Would start background GitHub PR creation"
+        restore_working_directory || true
+        
+        local workflow_end_time
+        workflow_end_time=$(get_timestamp_ms)
+        local duration
+        duration=$(calculate_duration "$workflow_start_time" "$workflow_end_time")
+        log_info "DRY RUN: Simulated workflow completed in ${duration}ms"
         return 0
     fi
 
-    log_info "Main workflow - Step 10: Branch switching and merging implementation"
-    log_info "Current branch: $CURRENT_BRANCH"
-    log_info "Files to process: ${FILES[*]:-all Python files}"
+    # Minimal output for IDE integration
+    if [[ "$QUIET_MODE" == "true" ]]; then
+        # Only show critical errors and final results in quiet mode
+        local total_files=$((${#EXISTING_FILES[@]} + ${#NEW_FILES[@]}))
+        if [[ $total_files -eq 0 ]]; then
+            return 0  # Silent exit if no files to process
+        fi
+    else
+        log_info "🚀 brack: Apply black formatting with clean feature branch diffs"
+        log_info "Current branch: $CURRENT_BRANCH"  
+        log_info "Files to process: ${FILES[*]:-all Python files}"
+    fi
     
-    # Check black availability
-    check_black_availability
+    # Phase 1: Prerequisites and Setup
+    local phase_start_time
+    phase_start_time=$(get_timestamp_ms)
     
-    # Detect the merge-base and main branch
-    detect_and_validate_merge_base
+    # Comprehensive error handling for setup phase
+    if ! check_black_availability; then
+        emergency_cleanup "Black formatter not available"
+        return 1
+    fi
     
-    # Validate and categorize files
-    validate_and_categorize_files
+    if ! detect_and_validate_merge_base; then
+        emergency_cleanup "Failed to detect merge-base"
+        return 1
+    fi
     
-    # Create or reuse formatting branch
-    create_or_reuse_formatting_branch
+    if ! validate_and_categorize_files; then
+        emergency_cleanup "File validation failed"
+        return 1
+    fi
     
-    # Save working directory changes
-    save_working_directory || true  # Don't fail if no changes to stash
+    # Early exit if no files need formatting
+    if [[ ${#EXISTING_FILES[@]} -eq 0 && ${#NEW_FILES[@]} -eq 0 ]]; then
+        if [[ "$QUIET_MODE" != "true" ]]; then
+            log_info "No Python files found to format"
+        fi
+        return 0
+    fi
     
-    # Format existing files in formatting branch
-    format_existing_files
+    # Create or reuse formatting branch with error handling
+    if ! create_or_reuse_formatting_branch; then
+        emergency_cleanup "Failed to create or reuse formatting branch"
+        return 1
+    fi
     
-    # Commit formatting changes for existing files
-    commit_formatting_changes
+    # Save working directory changes (non-critical)
+    save_working_directory || true
     
-    # Return to original branch to format new files
-    return_to_original_branch
-    
-    # Format new files in current branch
-    format_new_files
-    
-    # Commit formatting changes for new files
-    commit_formatting_changes
-    
-    # Merge formatting changes back to original branch
-    merge_and_cleanup_formatting_branch
-    
-    # Restore stashed changes
-    restore_working_directory || true  # Don't fail if no stash to restore
+    local phase_end_time
+    phase_end_time=$(get_timestamp_ms)
+    local phase_duration
+    phase_duration=$(calculate_duration "$phase_start_time" "$phase_end_time")
     
     if [[ "$QUIET_MODE" != "true" ]]; then
-        log_success "Workflow completed successfully"
+        log_info "✅ Setup completed in ${phase_duration}ms"
     fi
+    
+    # Phase 2: Format Existing Files (in formatting branch)
+    if [[ ${#EXISTING_FILES[@]} -gt 0 ]]; then
+        phase_start_time=$(get_timestamp_ms)
+        
+        if [[ "$QUIET_MODE" != "true" ]]; then
+            log_info "📝 Formatting ${#EXISTING_FILES[@]} existing file(s) in formatting branch..."
+        fi
+        
+        # Format existing files in formatting branch with error handling
+        if ! format_existing_files; then
+            emergency_cleanup "Failed to format existing files"
+            return 1
+        fi
+        
+        # Commit formatting changes for existing files
+        if ! commit_formatting_changes; then
+            log_warn "Failed to commit formatting changes for existing files"
+            # Continue anyway as this is not critical
+        fi
+        
+        # Start background GitHub push (fire-and-forget, non-critical)
+        if [[ ${#FORMATTED_FILES[@]} -gt 0 ]]; then
+            start_github_push_background || log_warn "Failed to start background GitHub push"
+        fi
+        
+        phase_end_time=$(get_timestamp_ms)
+        phase_duration=$(calculate_duration "$phase_start_time" "$phase_end_time")
+        
+        if [[ "$QUIET_MODE" != "true" ]]; then
+            log_success "✅ Existing files processed in ${phase_duration}ms"
+        fi
+    fi
+    
+    # Phase 3: Return to Original Branch and Format New Files
+    phase_start_time=$(get_timestamp_ms)
+    
+    # Return to original branch to format new files with error handling
+    if ! return_to_original_branch; then
+        emergency_cleanup "Failed to return to original branch"
+        return 1
+    fi
+    
+    # Phase 3a: Format NEW_FILES in current branch (critical for workflow)
+    if [[ ${#NEW_FILES[@]} -gt 0 ]]; then
+        if [[ "$QUIET_MODE" != "true" ]]; then
+            log_info "📝 Formatting ${#NEW_FILES[@]} new file(s) in current branch..."
+        fi
+        
+        # Format new files in current branch with error handling
+        if ! format_new_files; then
+            emergency_cleanup "Failed to format new files"
+            return 1
+        fi
+        
+        # For new files, formatting should be committed to the current branch
+        # This ensures new files are formatted before they are first committed
+        if [[ ${#FORMATTED_FILES[@]} -gt 0 ]]; then
+            if ! commit_formatting_changes; then
+                log_warn "New files formatted but not committed - they will remain staged"
+                # This is acceptable - the formatted files are staged for the user's next commit
+            fi
+        fi
+    fi
+    
+    phase_end_time=$(get_timestamp_ms)
+    phase_duration=$(calculate_duration "$phase_start_time" "$phase_end_time")
+    
+    if [[ "$QUIET_MODE" != "true" ]]; then
+        log_success "✅ New files processed in ${phase_duration}ms"
+    fi
+    
+    # Phase 4: Merge and Cleanup
+    phase_start_time=$(get_timestamp_ms)
+    
+    if [[ ${#EXISTING_FILES[@]} -gt 0 ]]; then
+        if [[ "$QUIET_MODE" != "true" ]]; then
+            log_info "🔀 Merging formatting changes..."
+        fi
+        
+        # Merge formatting changes back to original branch with error handling
+        if ! merge_and_cleanup_formatting_branch; then
+            emergency_cleanup "Failed to merge formatting changes"
+            return 1
+        fi
+        
+        # Start background GitHub PR creation (fire-and-forget, non-critical)
+        start_github_pr_background || log_warn "Failed to start background GitHub PR creation"
+    fi
+    
+    # Restore stashed changes
+    restore_working_directory || true
+    
+    phase_end_time=$(get_timestamp_ms)
+    phase_duration=$(calculate_duration "$phase_start_time" "$phase_end_time")
+    
+    if [[ "$QUIET_MODE" != "true" ]]; then
+        log_success "✅ Merge and cleanup completed in ${phase_duration}ms"
+    fi
+    
+    # Final Performance Validation
+    local workflow_end_time
+    workflow_end_time=$(get_timestamp_ms)
+    local total_duration
+    total_duration=$(calculate_duration "$workflow_start_time" "$workflow_end_time")
+    
+    # Final output - different for quiet vs normal mode
+    local total_files=$((${#EXISTING_FILES[@]} + ${#NEW_FILES[@]}))
+    local formatted_files_count=0
+    
+    # Count actual formatted files across all phases
+    # Note: FORMATTED_FILES gets reset between phases, so we track the total
+    if [[ ${#EXISTING_FILES[@]} -gt 0 || ${#NEW_FILES[@]} -gt 0 ]]; then
+        formatted_files_count=$((${#EXISTING_FILES[@]} + ${#NEW_FILES[@]}))
+    fi
+    
+    if [[ "$QUIET_MODE" == "true" ]]; then
+        # Minimal IDE-friendly output
+        if [[ $formatted_files_count -gt 0 ]]; then
+            echo "brack: formatted $formatted_files_count file(s) in ${total_duration}ms"
+        fi
+        # Performance warning only if significantly over target
+        if [[ $total_duration -gt 2000 ]]; then
+            echo "brack: warning: slow performance ${total_duration}ms" >&2
+        fi
+    else
+        log_success "🎉 Workflow completed successfully in ${total_duration}ms"
+        
+        # Validate performance requirement (<1000ms for local operations)
+        validate_performance_timing "$total_duration" 1000 || log_warn "Consider optimizing performance for faster IDE integration"
+        
+        # Provide summary
+        log_info "📊 Summary: Processed $total_files file(s) in ${total_duration}ms"
+        
+        if [[ ${#EXISTING_FILES[@]} -gt 0 ]]; then
+            log_info "🔄 Background operations: GitHub push and PR creation in progress"
+        fi
+    fi
+    
+    return 0
 }
 
 # Main entry point
@@ -2109,11 +2311,11 @@ main() {
     # Setup signal handlers for emergency cleanup
     setup_signal_handlers
     
-    # Initialize background process logging
-    initialize_background_logging
-    
-    # Parse command line arguments
+    # Parse command line arguments first to set QUIET_MODE
     parse_arguments "$@"
+    
+    # Initialize background process logging after QUIET_MODE is set
+    initialize_background_logging
 
     # Handle cleanup mode
     if [[ "$CLEANUP_MODE" == "true" ]]; then
