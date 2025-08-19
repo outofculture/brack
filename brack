@@ -994,28 +994,13 @@ cleanup_after_successful_merge() {
         return 0
     fi
     
-    # Delete the formatting branch since merge was successful
-    if check_formatting_branch_exists "$formatting_branch"; then
-        if [[ "$QUIET_MODE" != "true" ]]; then
-            log_info "Cleaning up formatting branch after successful merge: $formatting_branch"
-        fi
-        
-        if git branch -d "$formatting_branch" >/dev/null 2>&1; then
-            if [[ "$QUIET_MODE" != "true" ]]; then
-                log_success "Cleaned up formatting branch: $formatting_branch"
-            fi
-        else
-            # Try force delete if normal delete failed
-            if git branch -D "$formatting_branch" >/dev/null 2>&1; then
-                log_warn "Force deleted formatting branch: $formatting_branch"
-            else
-                log_warn "Failed to delete formatting branch '$formatting_branch' - manual cleanup required"
-                log_warn "Manual cleanup: git branch -D $formatting_branch"
-            fi
-        fi
+    # Keep the formatting branch for reuse on subsequent runs
+    # Only clean up the variable reference, not the actual branch
+    if [[ "$QUIET_MODE" != "true" ]]; then
+        log_info "Preserving formatting branch for reuse: $formatting_branch"
     fi
     
-    # Clear formatting branch variable
+    # Clear formatting branch variable but keep the actual git branch
     export FORMATTING_BRANCH=""
 }
 
@@ -1453,13 +1438,7 @@ generate_pr_title() {
     # Extract the original branch name from formatting branch
     local original_branch="${formatting_branch%-auto-black-formatting}"
     
-    if [[ $file_count -eq 1 ]]; then
-        echo "style: apply black formatting for $original_branch (1 file)"
-    elif [[ $file_count -gt 1 ]]; then
-        echo "style: apply black formatting for $original_branch ($file_count files)"
-    else
-        echo "style: apply black formatting for $original_branch"
-    fi
+    echo "style: apply black formatting for $original_branch"
 }
 
 generate_pr_body() {
