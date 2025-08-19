@@ -420,10 +420,13 @@ emergency_cleanup() {
     
     log_error "Performing emergency cleanup due to: $error_context"
     
-    # 1. Try to restore stashed changes
+    # 1. Clean up background processes
+    cleanup_all_background_processes
+    
+    # 2. Try to restore stashed changes
     cleanup_stash_on_error
     
-    # 2. Try to return to original branch
+    # 3. Try to return to original branch
     if [[ -n "$ORIGINAL_BRANCH" ]]; then
         local current_branch
         current_branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
@@ -446,18 +449,21 @@ emergency_cleanup() {
         fi
     fi
     
-    # 3. Provide guidance for formatting branch cleanup
+    # 4. Provide guidance for formatting branch cleanup
     if [[ -n "$FORMATTING_BRANCH" ]]; then
         log_error "Formatting branch '$FORMATTING_BRANCH' may need manual cleanup"
         log_error "To clean up: git branch -D $FORMATTING_BRANCH"
     fi
+    
+    # 5. Clean up background process logging
+    cleanup_background_logging
     
     log_error "Emergency cleanup completed. Check the error state file for details."
 }
 
 # Add signal handlers for emergency cleanup
 setup_signal_handlers() {
-    trap 'emergency_cleanup "Script interrupted"; exit 130' INT TERM
+    trap 'emergency_cleanup "Script interrupted"; cleanup_all_background_processes; exit 130' INT TERM
 }
 
 cleanup_signal_handlers() {
@@ -1009,6 +1015,277 @@ merge_and_cleanup_formatting_branch() {
     fi
 }
 
+# Background GitHub Operations functions
+# Global variables for background process management
+declare -A BACKGROUND_PROCESSES=()
+BACKGROUND_ERROR_LOG="background_errors.log"
+
+# Background process framework
+start_background_process() {
+    local process_name="$1"
+    local command_func="$2"
+    shift 2
+    local args=("$@")
+    
+    if [[ -z "$process_name" || -z "$command_func" ]]; then
+        log_error "Background process name and command function required"
+        return 1
+    fi
+    
+    if [[ "$QUIET_MODE" != "true" ]]; then
+        log_info "Starting background process: $process_name"
+    fi
+    
+    # Create background process
+    (
+        # Set up error logging for background process
+        exec 2>>"$BACKGROUND_ERROR_LOG"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting background process: $process_name" >&2
+        
+        # Call the command function with arguments
+        if "$command_func" "${args[@]}"; then
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] Background process completed successfully: $process_name" >&2
+        else
+            local exit_code=$?
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] Background process failed with exit code $exit_code: $process_name" >&2
+            
+            # Log detailed error to the main error file
+            {
+                echo "BACKGROUND PROCESS ERROR"
+                echo "========================"
+                echo "Process: $process_name"
+                echo "Timestamp: $(date '+%Y-%m-%d %H:%M:%S')"
+                echo "Exit Code: $exit_code"
+                echo "Command: $command_func ${args[*]}"
+                echo ""
+                echo "See $BACKGROUND_ERROR_LOG for detailed background process logs."
+                echo ""
+            } >> "$ERROR_FILE"
+            
+            exit $exit_code
+        fi
+    ) &
+    
+    local bg_pid=$!
+    BACKGROUND_PROCESSES["$process_name"]=$bg_pid
+    
+    if [[ "$QUIET_MODE" != "true" ]]; then
+        log_success "Background process started: $process_name (PID: $bg_pid)"
+    fi
+    
+    return 0
+}
+
+wait_for_background_process() {
+    local process_name="$1"
+    local timeout_seconds="${2:-30}"  # Default 30 second timeout
+    
+    if [[ -z "$process_name" ]]; then
+        log_error "Process name required for wait operation"
+        return 1
+    fi
+    
+    if [[ -z "${BACKGROUND_PROCESSES[$process_name]:-}" ]]; then
+        log_warn "No background process found with name: $process_name"
+        return 1
+    fi
+    
+    local bg_pid="${BACKGROUND_PROCESSES[$process_name]}"
+    
+    if [[ "$QUIET_MODE" != "true" ]]; then
+        log_info "Waiting for background process: $process_name (PID: $bg_pid)"
+    fi
+    
+    # Wait for process with timeout
+    local count=0
+    while kill -0 "$bg_pid" 2>/dev/null; do
+        if [[ $count -ge $timeout_seconds ]]; then
+            log_warn "Background process timeout after ${timeout_seconds}s: $process_name"
+            return 124  # Timeout exit code
+        fi
+        sleep 1
+        ((count++))
+    done
+    
+    # Check exit status
+    wait "$bg_pid"
+    local exit_code=$?
+    
+    if [[ $exit_code -eq 0 ]]; then
+        if [[ "$QUIET_MODE" != "true" ]]; then
+            log_success "Background process completed: $process_name"
+        fi
+    else
+        log_error "Background process failed with exit code $exit_code: $process_name"
+    fi
+    
+    # Remove from tracking
+    unset BACKGROUND_PROCESSES["$process_name"]
+    
+    return $exit_code
+}
+
+kill_background_process() {
+    local process_name="$1"
+    local force="${2:-false}"
+    
+    if [[ -z "$process_name" ]]; then
+        log_error "Process name required for kill operation"
+        return 1
+    fi
+    
+    if [[ -z "${BACKGROUND_PROCESSES[$process_name]:-}" ]]; then
+        log_warn "No background process found with name: $process_name"
+        return 1
+    fi
+    
+    local bg_pid="${BACKGROUND_PROCESSES[$process_name]}"
+    
+    if [[ "$QUIET_MODE" != "true" ]]; then
+        log_info "Terminating background process: $process_name (PID: $bg_pid)"
+    fi
+    
+    # Check if process is still running
+    if ! kill -0 "$bg_pid" 2>/dev/null; then
+        log_info "Background process already terminated: $process_name"
+        unset BACKGROUND_PROCESSES["$process_name"]
+        return 0
+    fi
+    
+    # Try graceful termination first
+    if kill -TERM "$bg_pid" 2>/dev/null; then
+        # Wait up to 5 seconds for graceful termination
+        local count=0
+        while kill -0 "$bg_pid" 2>/dev/null && [[ $count -lt 5 ]]; do
+            sleep 1
+            ((count++))
+        done
+        
+        # If still running and force is requested, use KILL
+        if kill -0 "$bg_pid" 2>/dev/null; then
+            if [[ "$force" == "true" ]]; then
+                log_warn "Force killing background process: $process_name"
+                kill -KILL "$bg_pid" 2>/dev/null || true
+            else
+                log_warn "Background process did not terminate gracefully: $process_name"
+                return 1
+            fi
+        fi
+    else
+        log_error "Failed to send termination signal to background process: $process_name"
+        return 1
+    fi
+    
+    # Remove from tracking
+    unset BACKGROUND_PROCESSES["$process_name"]
+    
+    if [[ "$QUIET_MODE" != "true" ]]; then
+        log_success "Background process terminated: $process_name"
+    fi
+    
+    return 0
+}
+
+cleanup_all_background_processes() {
+    if [[ ${#BACKGROUND_PROCESSES[@]} -eq 0 ]]; then
+        if [[ "$QUIET_MODE" != "true" ]]; then
+            log_info "No background processes to clean up"
+        fi
+        return 0
+    fi
+    
+    log_info "Cleaning up ${#BACKGROUND_PROCESSES[@]} background process(es)..."
+    
+    # First try graceful termination
+    for process_name in "${!BACKGROUND_PROCESSES[@]}"; do
+        kill_background_process "$process_name" false || true
+    done
+    
+    # Wait a moment for graceful termination
+    sleep 2
+    
+    # Force kill any remaining processes
+    for process_name in "${!BACKGROUND_PROCESSES[@]}"; do
+        kill_background_process "$process_name" true || true
+    done
+    
+    # Clear the array
+    BACKGROUND_PROCESSES=()
+    
+    if [[ "$QUIET_MODE" != "true" ]]; then
+        log_success "Background process cleanup completed"
+    fi
+}
+
+# Background error logging functions
+initialize_background_logging() {
+    # Create background error log with header
+    {
+        echo "BRACK BACKGROUND PROCESS LOG"
+        echo "============================"
+        echo "Started: $(date '+%Y-%m-%d %H:%M:%S')"
+        echo ""
+    } > "$BACKGROUND_ERROR_LOG"
+    
+    if [[ "$QUIET_MODE" != "true" ]]; then
+        log_info "Background process logging initialized: $BACKGROUND_ERROR_LOG"
+    fi
+}
+
+cleanup_background_logging() {
+    if [[ -f "$BACKGROUND_ERROR_LOG" ]]; then
+        # Check if there were any errors
+        if grep -q "ERROR\|FAILED\|failed" "$BACKGROUND_ERROR_LOG" 2>/dev/null; then
+            log_warn "Background process errors detected. Check: $BACKGROUND_ERROR_LOG"
+        else
+            # Remove log file if no errors
+            rm -f "$BACKGROUND_ERROR_LOG"
+            if [[ "$QUIET_MODE" != "true" ]]; then
+                log_info "Background process logging cleaned up (no errors)"
+            fi
+        fi
+    fi
+}
+
+# Test/mock functions for GitHub CLI
+mock_github_push() {
+    local branch="$1"
+    local delay="${2:-2}"  # Default 2 second delay to simulate network operation
+    
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Mock: Pushing branch $branch to GitHub..." >&2
+    sleep "$delay"
+    
+    # Simulate success/failure based on branch name (for testing)
+    if [[ "$branch" =~ "fail" ]]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] Mock: GitHub push failed for branch $branch" >&2
+        return 1
+    else
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] Mock: GitHub push succeeded for branch $branch" >&2
+        return 0
+    fi
+}
+
+mock_github_pr_create() {
+    local branch="$1"
+    local title="$2"
+    local body="$3"
+    local delay="${4:-3}"  # Default 3 second delay to simulate API call
+    
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Mock: Creating PR for branch $branch..." >&2
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Mock: PR Title: $title" >&2
+    sleep "$delay"
+    
+    # Simulate success/failure based on branch name (for testing)
+    if [[ "$branch" =~ "fail" ]]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] Mock: GitHub PR creation failed for branch $branch" >&2
+        return 1
+    else
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] Mock: GitHub PR created successfully for branch $branch" >&2
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] Mock: PR URL: https://github.com/test/repo/pull/123" >&2
+        return 0
+    fi
+}
+
 # Black formatting integration functions
 check_black_availability() {
     if command -v black >/dev/null 2>&1; then
@@ -1410,12 +1687,16 @@ main() {
     # Setup signal handlers for emergency cleanup
     setup_signal_handlers
     
+    # Initialize background process logging
+    initialize_background_logging
+    
     # Parse command line arguments
     parse_arguments "$@"
 
     # Handle cleanup mode
     if [[ "$CLEANUP_MODE" == "true" ]]; then
         cleanup_error_state
+        cleanup_background_logging
         exit $EXIT_SUCCESS
     fi
 
@@ -1427,6 +1708,10 @@ main() {
 
     # Run main workflow
     main_workflow
+    
+    # Clean up background processes and logging
+    cleanup_all_background_processes
+    cleanup_background_logging
     
     # Clean up signal handlers
     cleanup_signal_handlers
