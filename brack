@@ -1443,6 +1443,271 @@ start_github_push_background() {
     return 0
 }
 
+# GitHub PR Creation Implementation functions
+generate_pr_title() {
+    local formatting_branch="$1"
+    local file_count="${2:-0}"
+    
+    if [[ -z "$formatting_branch" ]]; then
+        echo "style: apply black formatting"
+        return 0
+    fi
+    
+    # Extract the original branch name from formatting branch
+    local original_branch="${formatting_branch%-auto-black-formatting}"
+    
+    if [[ $file_count -eq 1 ]]; then
+        echo "style: apply black formatting for $original_branch (1 file)"
+    elif [[ $file_count -gt 1 ]]; then
+        echo "style: apply black formatting for $original_branch ($file_count files)"
+    else
+        echo "style: apply black formatting for $original_branch"
+    fi
+}
+
+generate_pr_body() {
+    local formatting_branch="$1"
+    local original_branch="${2:-main}"
+    local file_list=("${@:3}")
+    
+    local pr_body
+    pr_body=$(cat << EOF
+## Summary
+
+This PR applies black formatting to Python files in the \`${formatting_branch%-auto-black-formatting}\` branch.
+
+## Changes
+
+This PR contains only formatting changes applied by the \`black\` Python code formatter. No functional changes have been made.
+
+EOF
+)
+    
+    # Add file list if provided
+    if [[ ${#file_list[@]} -gt 0 ]]; then
+        pr_body+=$(cat << EOF
+### Files Modified
+
+EOF
+)
+        for file in "${file_list[@]}"; do
+            pr_body+="- \`$file\`"$'\n'
+        done
+        pr_body+=$'\n'
+    fi
+    
+    pr_body+=$(cat << EOF
+## Review Notes
+
+- ✅ These are **formatting-only changes** with no functional modifications
+- ✅ All changes were applied automatically by \`black\`
+- ✅ Original functionality is preserved
+- ✅ Safe to merge without detailed code review
+
+## Merge Instructions
+
+This formatting PR can be safely merged into \`${original_branch}\` and then the changes can be merged back to the feature branch.
+
+---
+
+🤖 *Generated automatically by [brack](https://github.com/outofculture/brack) - Apply black formatting with clean diffs*
+EOF
+)
+    
+    echo "$pr_body"
+}
+
+check_existing_pr() {
+    local formatting_branch="$1"
+    local base_branch="${2:-main}"
+    
+    if [[ -z "$formatting_branch" ]]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: Branch name required for PR check" >&2
+        return 1
+    fi
+    
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Checking for existing PR: $formatting_branch -> $base_branch" >&2
+    
+    # Check if there's already a PR for this branch
+    local existing_pr_url
+    existing_pr_url=$(gh pr list --head "$formatting_branch" --base "$base_branch" --json url --jq '.[0].url' 2>/dev/null)
+    
+    if [[ -n "$existing_pr_url" && "$existing_pr_url" != "null" ]]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] Found existing PR: $existing_pr_url" >&2
+        echo "$existing_pr_url"
+        return 0
+    else
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] No existing PR found" >&2
+        return 1
+    fi
+}
+
+create_github_pr() {
+    local formatting_branch="$1"
+    local base_branch="${2:-main}"
+    local pr_title="$3"
+    local pr_body="$4"
+    
+    if [[ -z "$formatting_branch" || -z "$pr_title" ]]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: Branch name and title required for PR creation" >&2
+        return 1
+    fi
+    
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Creating GitHub PR: $formatting_branch -> $base_branch" >&2
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] PR Title: $pr_title" >&2
+    
+    # Create the PR using GitHub CLI
+    local pr_output
+    local pr_exit_code
+    
+    pr_output=$(gh pr create \
+        --head "$formatting_branch" \
+        --base "$base_branch" \
+        --title "$pr_title" \
+        --body "$pr_body" \
+        2>&1)
+    pr_exit_code=$?
+    
+    if [[ $pr_exit_code -eq 0 ]]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] Successfully created PR" >&2
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] PR Output: $pr_output" >&2
+        
+        # Extract PR URL from output
+        local pr_url
+        pr_url=$(echo "$pr_output" | grep -o 'https://github.com/[^/]*/[^/]*/pull/[0-9]*' | head -1)
+        if [[ -n "$pr_url" ]]; then
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] PR URL: $pr_url" >&2
+            echo "$pr_url"
+        fi
+        
+        return 0
+    else
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] Failed to create PR" >&2
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] Error: $pr_output" >&2
+        
+        # Check for specific error types
+        if [[ "$pr_output" =~ "Authentication failed" || "$pr_output" =~ "Bad credentials" ]]; then
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] Authentication error detected" >&2
+            return 2
+        elif [[ "$pr_output" =~ "already exists" ]]; then
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] PR may already exist" >&2
+            return 3
+        fi
+        
+        return 1
+    fi
+}
+
+update_github_pr() {
+    local pr_url="$1"
+    local pr_title="$2"
+    local pr_body="$3"
+    
+    if [[ -z "$pr_url" || -z "$pr_title" ]]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: PR URL and title required for PR update" >&2
+        return 1
+    fi
+    
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Updating GitHub PR: $pr_url" >&2
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] New Title: $pr_title" >&2
+    
+    # Update the PR using GitHub CLI
+    local update_output
+    local update_exit_code
+    
+    update_output=$(gh pr edit "$pr_url" \
+        --title "$pr_title" \
+        --body "$pr_body" \
+        2>&1)
+    update_exit_code=$?
+    
+    if [[ $update_exit_code -eq 0 ]]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] Successfully updated PR" >&2
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] Update Output: $update_output" >&2
+        return 0
+    else
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] Failed to update PR" >&2
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] Error: $update_output" >&2
+        return 1
+    fi
+}
+
+create_or_update_pr_background() {
+    local formatting_branch="$FORMATTING_BRANCH"
+    local main_branch="$MAIN_BRANCH"
+    local formatted_files=("${FORMATTED_FILES[@]}")
+    
+    if [[ -z "$formatting_branch" || -z "$main_branch" ]]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: Required branch variables not available" >&2
+        return 1
+    fi
+    
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Background: Creating or updating PR for $formatting_branch" >&2
+    
+    # Check GitHub authentication
+    if ! check_github_authentication >/dev/null 2>&1; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: GitHub authentication failed" >&2
+        return 2
+    fi
+    
+    # Generate PR content
+    local pr_title
+    local pr_body
+    
+    pr_title=$(generate_pr_title "$formatting_branch" "${#formatted_files[@]}")
+    pr_body=$(generate_pr_body "$formatting_branch" "$main_branch" "${formatted_files[@]}")
+    
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Generated PR title: $pr_title" >&2
+    
+    # Check for existing PR
+    local existing_pr_url
+    if existing_pr_url=$(check_existing_pr "$formatting_branch" "$main_branch"); then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] Updating existing PR: $existing_pr_url" >&2
+        
+        if update_github_pr "$existing_pr_url" "$pr_title" "$pr_body"; then
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] Successfully updated existing PR" >&2
+            return 0
+        else
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] Failed to update existing PR" >&2
+            return 1
+        fi
+    else
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] Creating new PR" >&2
+        
+        local new_pr_url
+        if new_pr_url=$(create_github_pr "$formatting_branch" "$main_branch" "$pr_title" "$pr_body"); then
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] Successfully created new PR: $new_pr_url" >&2
+            return 0
+        else
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] Failed to create new PR" >&2
+            return 1
+        fi
+    fi
+}
+
+# Wrapper to start GitHub PR creation in background
+start_github_pr_background() {
+    local formatting_branch="$FORMATTING_BRANCH"
+    
+    if [[ -z "$formatting_branch" ]]; then
+        log_warn "No formatting branch available for background PR creation"
+        return 1
+    fi
+    
+    if [[ "$QUIET_MODE" != "true" ]]; then
+        log_info "Starting background GitHub PR creation for: $formatting_branch"
+    fi
+    
+    # Start the PR creation operation in background
+    start_background_process "github_pr" "create_or_update_pr_background"
+    
+    if [[ "$QUIET_MODE" != "true" ]]; then
+        log_success "GitHub PR creation started in background"
+    fi
+    
+    return 0
+}
+
 # Black formatting integration functions
 check_black_availability() {
     if command -v black >/dev/null 2>&1; then
