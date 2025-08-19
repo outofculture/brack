@@ -172,6 +172,7 @@ parse_arguments() {
     export CLEANUP_MODE="$cleanup_mode"
     export FILES=("${files[@]}")
     export BLACK_ARGS=("${black_args[@]}")
+    export FORMATTED_FILES=()
 }
 
 # Error state management functions
