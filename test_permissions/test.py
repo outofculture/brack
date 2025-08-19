@@ -1,1 +1,2 @@
-def test_permission(): pass
+def test_permission():
+    pass
