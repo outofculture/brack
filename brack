@@ -2082,14 +2082,8 @@ main_workflow() {
         return 0
     fi
 
-    # Minimal output for IDE integration
-    if [[ "$QUIET_MODE" == "true" ]]; then
-        # Only show critical errors and final results in quiet mode
-        local total_files=$((${#EXISTING_FILES[@]} + ${#NEW_FILES[@]}))
-        if [[ $total_files -eq 0 ]]; then
-            return 0  # Silent exit if no files to process
-        fi
-    else
+    # Initial output (quiet mode will be minimal)
+    if [[ "$QUIET_MODE" != "true" ]]; then
         log_info "🚀 brack: Apply black formatting with clean feature branch diffs"
         log_info "Current branch: $CURRENT_BRANCH"  
         log_info "Files to process: ${FILES[*]:-all Python files}"
