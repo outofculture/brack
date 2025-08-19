@@ -11,3 +11,6 @@ def modified_existing_function(a,b,c):
 
 def committed_function(a,b):
     return a*b
+
+def error_recovery_test(x,y):
+    return x+y
