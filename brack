@@ -415,6 +415,37 @@ cleanup_stash_on_error() {
     fi
 }
 
+cleanup_all_background_processes() {
+    if [[ ${#BACKGROUND_PROCESSES[@]} -eq 0 ]]; then
+        if [[ "$QUIET_MODE" != "true" ]]; then
+            log_info "No background processes to clean up"
+        fi
+        return 0
+    fi
+
+    log_info "Cleaning up ${#BACKGROUND_PROCESSES[@]} background process(es)..."
+
+    # First try graceful termination
+    for process_name in "${!BACKGROUND_PROCESSES[@]}"; do
+        kill_background_process "$process_name" false || true
+    done
+
+    # Wait a moment for graceful termination
+    sleep 2
+
+    # Force kill any remaining processes
+    for process_name in "${!BACKGROUND_PROCESSES[@]}"; do
+        kill_background_process "$process_name" true || true
+    done
+
+    # Clear the array
+    BACKGROUND_PROCESSES=()
+
+    if [[ "$QUIET_MODE" != "true" ]]; then
+        log_success "Background process cleanup completed"
+    fi
+}
+
 # Comprehensive error cleanup function
 emergency_cleanup() {
     local error_context="${1:-Unknown error context}"
@@ -423,7 +454,7 @@ emergency_cleanup() {
     
     # 1. Clean up background processes
     cleanup_all_background_processes
-    
+
     # 2. Try to restore stashed changes
     cleanup_stash_on_error
     
@@ -1181,37 +1212,6 @@ kill_background_process() {
     fi
     
     return 0
-}
-
-cleanup_all_background_processes() {
-    if [[ ${#BACKGROUND_PROCESSES[@]} -eq 0 ]]; then
-        if [[ "$QUIET_MODE" != "true" ]]; then
-            log_info "No background processes to clean up"
-        fi
-        return 0
-    fi
-    
-    log_info "Cleaning up ${#BACKGROUND_PROCESSES[@]} background process(es)..."
-    
-    # First try graceful termination
-    for process_name in "${!BACKGROUND_PROCESSES[@]}"; do
-        kill_background_process "$process_name" false || true
-    done
-    
-    # Wait a moment for graceful termination
-    sleep 2
-    
-    # Force kill any remaining processes
-    for process_name in "${!BACKGROUND_PROCESSES[@]}"; do
-        kill_background_process "$process_name" true || true
-    done
-    
-    # Clear the array
-    BACKGROUND_PROCESSES=()
-    
-    if [[ "$QUIET_MODE" != "true" ]]; then
-        log_success "Background process cleanup completed"
-    fi
 }
 
 # Background error logging functions
@@ -2343,11 +2343,8 @@ main() {
     # Run main workflow
     main_workflow
     
-    # Clean up background processes and logging
-    cleanup_all_background_processes
+    # Clean up
     cleanup_background_logging
-    
-    # Clean up signal handlers
     cleanup_signal_handlers
 }
 
