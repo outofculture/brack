@@ -943,12 +943,8 @@ validate_merge_success() {
         return 1
     fi
     
-    # Verify the merge commit exists
-    if ! git log --oneline -1 | grep -q "Merge formatting changes"; then
-        log_warn "Expected merge commit not found in recent history"
-        return 1
-    fi
-    
+    # Don't validate specific commit message - if merge succeeded, it succeeded
+    # This allows manual merges with different commit messages
     if [[ "$QUIET_MODE" != "true" ]]; then
         log_success "Merge validation completed successfully"
     fi
@@ -2185,9 +2181,11 @@ main_workflow() {
             # Continue anyway as this is not critical
         fi
         
-        # Start background GitHub push (fire-and-forget, non-critical)
+        # Start background GitHub push and PR creation (fire-and-forget, non-critical)
         if [[ ${#FORMATTED_FILES[@]} -gt 0 ]]; then
             start_github_push_background || log_warn "Failed to start background GitHub push"
+            # Start PR creation regardless of whether push succeeds - it will handle its own errors
+            start_github_pr_background || log_warn "Failed to start background GitHub PR creation"
         fi
         
         phase_end_time=$(get_timestamp_ms)
@@ -2249,13 +2247,24 @@ main_workflow() {
             emergency_cleanup "Failed to merge formatting changes"
             return 1
         fi
-        
-        # Start background GitHub PR creation (fire-and-forget, non-critical)
-        start_github_pr_background || log_warn "Failed to start background GitHub PR creation"
     fi
     
     # Restore stashed changes
     restore_working_directory || true
+    
+    # After restoring stashed changes, format new files again to apply formatting to local changes
+    if [[ ${#NEW_FILES[@]} -gt 0 && "$STASH_CREATED" == "true" ]]; then
+        if [[ "$QUIET_MODE" != "true" ]]; then
+            log_info "🎨 Applying black formatting to restored local changes..."
+        fi
+        
+        # Format new files with user-specified black arguments
+        format_files_with_black "${NEW_FILES[@]}" || log_warn "Failed to format restored local changes"
+        
+        if [[ "$QUIET_MODE" != "true" ]]; then
+            log_success "Local changes formatted"
+        fi
+    fi
     
     phase_end_time=$(get_timestamp_ms)
     phase_duration=$(calculate_duration "$phase_start_time" "$phase_end_time")
