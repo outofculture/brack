@@ -1286,6 +1286,163 @@ mock_github_pr_create() {
     fi
 }
 
+# GitHub Push Implementation functions
+check_git_remote_origin() {
+    if git remote get-url origin >/dev/null 2>&1; then
+        local origin_url
+        origin_url=$(git remote get-url origin)
+        if [[ "$QUIET_MODE" != "true" ]]; then
+            log_info "Remote origin found: $origin_url"
+        fi
+        return 0
+    else
+        log_error "No remote origin configured"
+        return 1
+    fi
+}
+
+check_github_authentication() {
+    # Check if gh CLI is available and authenticated
+    if ! command -v gh >/dev/null 2>&1; then
+        log_error "GitHub CLI (gh) not found. Please install: https://cli.github.com/"
+        return 1
+    fi
+    
+    # Check authentication status
+    if gh auth status >/dev/null 2>&1; then
+        if [[ "$QUIET_MODE" != "true" ]]; then
+            log_info "GitHub CLI authenticated"
+        fi
+        return 0
+    else
+        log_error "GitHub CLI not authenticated. Run: gh auth login"
+        return 1
+    fi
+}
+
+push_branch_with_retry() {
+    local branch="$1"
+    local max_attempts="${2:-3}"
+    local base_delay="${3:-2}"  # Base delay in seconds
+    
+    if [[ -z "$branch" ]]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: Branch name required for push operation" >&2
+        return 1
+    fi
+    
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting push operation for branch: $branch" >&2
+    
+    local attempt=1
+    local delay=$base_delay
+    
+    while [[ $attempt -le $max_attempts ]]; do
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] Push attempt $attempt/$max_attempts for branch: $branch" >&2
+        
+        # Try to push the branch
+        local push_output
+        local push_exit_code
+        
+        # Use --force-with-lease for safer force push
+        push_output=$(git push --force-with-lease -u origin "$branch" 2>&1)
+        push_exit_code=$?
+        
+        if [[ $push_exit_code -eq 0 ]]; then
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] Successfully pushed branch: $branch" >&2
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] Push output: $push_output" >&2
+            return 0
+        else
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] Push attempt $attempt failed with exit code $push_exit_code" >&2
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] Push error: $push_output" >&2
+            
+            # Check for specific error types
+            if [[ "$push_output" =~ "Authentication failed" || "$push_output" =~ "permission denied" ]]; then
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] Authentication error detected - aborting retries" >&2
+                return 2  # Authentication error
+            elif [[ "$push_output" =~ "Connection refused" || "$push_output" =~ "Network is unreachable" ]]; then
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] Network error detected - will retry" >&2
+            elif [[ "$push_output" =~ "rejected" && "$push_output" =~ "non-fast-forward" ]]; then
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] Non-fast-forward push rejected - will retry with force" >&2
+            fi
+            
+            # If this was the last attempt, return the error
+            if [[ $attempt -eq $max_attempts ]]; then
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] All push attempts failed for branch: $branch" >&2
+                return $push_exit_code
+            fi
+            
+            # Wait before retrying (exponential backoff)
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] Waiting ${delay}s before retry..." >&2
+            sleep "$delay"
+            delay=$((delay * 2))  # Exponential backoff
+            ((attempt++))
+        fi
+    done
+    
+    return 1  # Should never reach here
+}
+
+push_formatting_branch_background() {
+    local formatting_branch="$FORMATTING_BRANCH"
+    
+    if [[ -z "$formatting_branch" ]]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: No formatting branch available for push" >&2
+        return 1
+    fi
+    
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Background: Pushing formatting branch $formatting_branch" >&2
+    
+    # Check remote configuration
+    if ! check_git_remote_origin >/dev/null 2>&1; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: Remote origin not configured" >&2
+        return 1
+    fi
+    
+    # Check GitHub authentication  
+    if ! check_github_authentication >/dev/null 2>&1; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: GitHub authentication failed" >&2
+        return 2
+    fi
+    
+    # Perform the push with retry logic
+    local push_result
+    push_result=$(push_branch_with_retry "$formatting_branch" 3 2)
+    local push_exit_code=$?
+    
+    if [[ $push_exit_code -eq 0 ]]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] Successfully pushed formatting branch: $formatting_branch" >&2
+        return 0
+    elif [[ $push_exit_code -eq 2 ]]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] Authentication error pushing branch: $formatting_branch" >&2
+        return 2
+    else
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] Failed to push formatting branch: $formatting_branch" >&2
+        return 1
+    fi
+}
+
+# Wrapper to start GitHub push in background
+start_github_push_background() {
+    local formatting_branch="$FORMATTING_BRANCH"
+    
+    if [[ -z "$formatting_branch" ]]; then
+        log_warn "No formatting branch available for background push"
+        return 1
+    fi
+    
+    if [[ "$QUIET_MODE" != "true" ]]; then
+        log_info "Starting background GitHub push for: $formatting_branch"
+    fi
+    
+    # Start the push operation in background
+    start_background_process "github_push" "push_formatting_branch_background"
+    
+    if [[ "$QUIET_MODE" != "true" ]]; then
+        log_success "GitHub push started in background"
+    fi
+    
+    return 0
+}
+
 # Black formatting integration functions
 check_black_availability() {
     if command -v black >/dev/null 2>&1; then
