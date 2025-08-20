@@ -936,19 +936,36 @@ merge_formatting_changes() {
 }
 
 handle_merge_conflicts() {
-    log_error "Merge conflicts detected. Attempting automatic cleanup..."
+    log_info "Merge conflicts detected. Resolving automatically..."
+    log_info "Taking coding branch changes (ignoring formatting branch) since we'll re-run black anyway"
     
-    # Abort the merge to return to clean state
-    if git merge --abort >/dev/null 2>&1; then
-        log_info "Merge aborted successfully, repository returned to clean state"
+    # Always take our changes (the coding branch) and ignore theirs (formatting branch)
+    if git checkout --ours . >/dev/null 2>&1; then
+        log_info "Resolved conflicts by keeping coding branch changes"
         
-        # Try to restore stashed changes since merge failed
-        cleanup_stash_on_error
-        
-        create_error_state "Merge conflicts detected between formatting changes and current branch. Manual resolution required." "Merge conflicts"
-        exit $EXIT_GENERAL_ERROR
+        # Stage all resolved files
+        if git add . >/dev/null 2>&1; then
+            log_info "Staged resolved changes"
+            
+            # Complete the merge with a commit explaining the resolution strategy
+            if git commit -m "Resolve merge conflicts by keeping coding branch changes
+
+The formatting branch changes are ignored since black will be re-applied
+to the final result anyway, making the formatting branch content irrelevant." >/dev/null 2>&1; then
+                log_info "Merge conflicts resolved successfully"
+                return 0
+            else
+                log_error "Failed to commit merge conflict resolution"
+                create_error_state "Failed to commit after resolving merge conflicts" "Merge conflict resolution"
+                exit $EXIT_GENERAL_ERROR
+            fi
+        else
+            log_error "Failed to stage resolved changes"
+            create_error_state "Failed to stage files after resolving merge conflicts" "Merge conflict resolution"
+            exit $EXIT_GENERAL_ERROR
+        fi
     else
-        log_error "Failed to abort merge - repository may be in inconsistent state"
+        log_error "Failed to resolve conflicts with 'git checkout --ours .'"
         log_error "MANUAL RECOVERY REQUIRED:"
         log_error "  1. Check repository status: git status"
         log_error "  2. Resolve conflicts manually or abort merge: git merge --abort"
@@ -956,7 +973,7 @@ handle_merge_conflicts() {
         log_error "  4. Clean up formatting branch: git branch -D $FORMATTING_BRANCH"
         log_error "  5. Run: brack --cleanup"
         
-        create_error_state "Failed to abort merge after conflicts - repository in inconsistent state" "Merge conflict cleanup"
+        create_error_state "Failed to auto-resolve merge conflicts - repository in inconsistent state" "Merge conflict resolution"
         exit $EXIT_GENERAL_ERROR
     fi
 }

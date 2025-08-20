@@ -6,11 +6,28 @@ set -e
 echo "=== Merge Conflict Error Tests ==="
 echo
 
-# Clean up any existing error states
-./brack --cleanup >/dev/null 2>&1 || true
-
-# Store original branch
+# Store original working directory
+ORIGINAL_DIR=$(pwd)
 ORIGINAL_BRANCH=$(git branch --show-current)
+
+# Create temporary directory for testing
+TEST_DIR=$(mktemp -d)
+echo "Using temporary test repository: $TEST_DIR"
+
+# Initialize test repository
+cd "$TEST_DIR"
+git init >/dev/null 2>&1
+git config user.name "Test User" >/dev/null 2>&1
+git config user.email "test@example.com" >/dev/null 2>&1
+
+# Copy brack script to test directory
+cp "$ORIGINAL_DIR/brack" .
+chmod +x brack
+
+# Create initial commit so we have a proper git history
+echo "# Test Repository" > README.md
+git add README.md
+git commit -m "Initial commit" >/dev/null
 
 # Test 1: Create a scenario that might cause merge conflicts
 echo "Test 1: Merge conflict scenario simulation"
@@ -70,8 +87,8 @@ else
     echo "✅ INFO: brack completed (merge conflicts are handled during the merge step)"
 fi
 
-# Clean up branches
-git checkout $ORIGINAL_BRANCH >/dev/null 2>&1
+# Clean up branches (we're in test repo, so use main instead of ORIGINAL_BRANCH)
+git checkout main >/dev/null 2>&1 || git checkout master >/dev/null 2>&1 || true
 git branch -D test-merge-conflict >/dev/null 2>&1 || true
 git reset --hard HEAD~2 >/dev/null 2>&1
 
@@ -188,6 +205,10 @@ fi
 git reset --hard HEAD~1 >/dev/null 2>&1
 ./brack --cleanup >/dev/null 2>&1 || true
 echo
+
+# Return to original directory and cleanup
+cd "$ORIGINAL_DIR"
+rm -rf "$TEST_DIR"
 
 echo "=== Merge Conflict Test Summary ==="
 echo "Tested various merge and git state scenarios:"
