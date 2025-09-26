@@ -55,11 +55,11 @@ show_help() {
 $SCRIPT_NAME - Apply black formatting with clean feature branch diffs
 
 USAGE:
-    $SCRIPT_NAME [OPTIONS] [FILES...]
+    $SCRIPT_NAME [OPTIONS] [FILES...] [-- BLACK_ARGS...]
 
 DESCRIPTION:
     Applies black formatting to Python files while maintaining clean feature branch diffs.
-    Creates separate PRs for formatting changes, allowing reviewers to see pure formatting 
+    Creates separate PRs for formatting changes, allowing reviewers to see pure formatting
     changes in isolation while keeping the developer's feature branch clean and formatted.
 
 OPTIONS:
@@ -68,15 +68,21 @@ OPTIONS:
     -q, --quiet         Run in quiet mode (minimal output for IDE integration)
     --dry-run           Show what would be done without making changes
     --cleanup           Clean up any existing error state files
+    --black-path PATH   Specify custom path to black executable
 
 ARGUMENTS:
     FILES...            Python files to format (if not specified, formats all Python files)
+    -- BLACK_ARGS...    Pass additional arguments to black formatter (after --)
 
 EXAMPLES:
-    $SCRIPT_NAME                    # Format all Python files in the repository
-    $SCRIPT_NAME file1.py file2.py # Format specific files
-    $SCRIPT_NAME --dry-run         # Preview what would be formatted
-    $SCRIPT_NAME --cleanup         # Clean up error state
+    $SCRIPT_NAME                           # Format all Python files in the repository
+    $SCRIPT_NAME file1.py file2.py        # Format specific files
+    $SCRIPT_NAME --dry-run                # Preview what would be formatted
+    $SCRIPT_NAME --cleanup                # Clean up error state
+    $SCRIPT_NAME -- --line-length 100     # Format with custom line length
+    $SCRIPT_NAME file.py -- --target-version py38 --line-length 88
+    $SCRIPT_NAME --black-path /usr/local/bin/black  # Use custom black executable
+    $SCRIPT_NAME --black-path ./venv/bin/black -- --line-length 100
 
 WORKFLOW:
     1. Detects files that need formatting
@@ -112,6 +118,7 @@ parse_arguments() {
     local cleanup_mode=false
     local files=()
     local black_args=()
+    local black_path=""
 
     while [[ $# -gt 0 ]]; do
         case $1 in
@@ -133,6 +140,21 @@ parse_arguments() {
                 ;;
             --cleanup)
                 cleanup_mode=true
+                shift
+                ;;
+            --black-path)
+                if [[ -n "${2:-}" && ! "${2:-}" =~ ^- ]]; then
+                    black_path="$2"
+                    shift 2
+                else
+                    error_exit "--black-path requires a path argument" $EXIT_INVALID_ARGS
+                fi
+                ;;
+            --black-path=*)
+                black_path="${1#*=}"
+                if [[ -z "$black_path" ]]; then
+                    error_exit "--black-path requires a path argument" $EXIT_INVALID_ARGS
+                fi
                 shift
                 ;;
             --black-args=*)
@@ -171,6 +193,7 @@ parse_arguments() {
     export CLEANUP_MODE="$cleanup_mode"
     export FILES=("${files[@]}")
     export BLACK_ARGS=("${black_args[@]}")
+    export BLACK_PATH="$black_path"
     export FORMATTED_FILES=()
 }
 
@@ -1340,7 +1363,7 @@ kill_background_process() {
 initialize_background_logging() {
     local background_log_path
     background_log_path=$(get_background_log_path)
-    
+
     # Create background error log with header
     {
         echo "BRACK BACKGROUND PROCESS LOG"
@@ -1348,7 +1371,10 @@ initialize_background_logging() {
         echo "Started: $(date '+%Y-%m-%d %H:%M:%S')"
         echo ""
     } > "$background_log_path"
-    
+
+    # Track that we have initialized logging but no processes started yet
+    export BACKGROUND_PROCESSES_STARTED="false"
+
     if [[ "$QUIET_MODE" != "true" ]]; then
         log_info "Background process logging initialized: $background_log_path"
     fi
@@ -1357,16 +1383,24 @@ initialize_background_logging() {
 cleanup_background_logging() {
     local background_log_path
     background_log_path=$(get_background_log_path)
-    
+
     if [[ -f "$background_log_path" ]]; then
-        # Check if there were any errors
-        if grep -q "ERROR\|FAILED\|failed" "$background_log_path" 2>/dev/null; then
-            log_warn "Background process errors detected. Check: $background_log_path"
-        else
-            # Remove log file if no errors
+        # If no background processes were started, always clean up the log file
+        if [[ "${BACKGROUND_PROCESSES_STARTED:-false}" == "false" ]]; then
             rm -f "$background_log_path"
             if [[ "$QUIET_MODE" != "true" ]]; then
-                log_info "Background process logging cleaned up (no errors)"
+                log_info "Background process logging cleaned up (no processes started)"
+            fi
+        else
+            # Check if there were any errors in background processes
+            if grep -q "ERROR\|FAILED\|failed" "$background_log_path" 2>/dev/null; then
+                log_warn "Background process errors detected. Check: $background_log_path"
+            else
+                # Remove log file if no errors
+                rm -f "$background_log_path"
+                if [[ "$QUIET_MODE" != "true" ]]; then
+                    log_info "Background process logging cleaned up (no errors)"
+                fi
             fi
         fi
     fi
@@ -1560,11 +1594,14 @@ start_github_push_background() {
     
     # Start the push operation in background
     start_background_process "github_push" "push_formatting_branch_background"
-    
+
+    # Mark that we have started background processes
+    export BACKGROUND_PROCESSES_STARTED="true"
+
     if [[ "$QUIET_MODE" != "true" ]]; then
         log_success "GitHub push started in background"
     fi
-    
+
     return 0
 }
 
@@ -1819,27 +1856,54 @@ start_github_pr_background() {
     
     # Start the PR creation operation in background
     start_background_process "github_pr" "create_or_update_pr_background"
-    
+
+    # Mark that we have started background processes
+    export BACKGROUND_PROCESSES_STARTED="true"
+
     if [[ "$QUIET_MODE" != "true" ]]; then
         log_success "GitHub PR creation started in background"
     fi
-    
+
     return 0
 }
 
 # Black formatting integration functions
 check_black_availability() {
-    if command -v black >/dev/null 2>&1; then
-        local black_path
-        black_path=$(command -v black)
-        if [[ "$QUIET_MODE" != "true" ]]; then
-            log_info "Black formatter found: $black_path"
+    local black_exec=""
+
+    if [[ -n "$BLACK_PATH" ]]; then
+        # Use custom black path
+        black_exec="$BLACK_PATH"
+        if [[ ! -f "$black_exec" ]]; then
+            create_error_state "Custom black executable not found: $black_exec" "Black availability check"
+            exit $EXIT_GENERAL_ERROR
+        elif [[ ! -x "$black_exec" ]]; then
+            create_error_state "Custom black executable not executable: $black_exec" "Black availability check"
+            exit $EXIT_GENERAL_ERROR
         fi
-        return 0
     else
-        create_error_state "Black formatter not found in PATH. Please install black: pip install black" "Black availability check"
+        # Use default black from PATH
+        if command -v black >/dev/null 2>&1; then
+            black_exec=$(command -v black)
+        else
+            create_error_state "Black formatter not found in PATH. Please install black: pip install black" "Black availability check"
+            exit $EXIT_GENERAL_ERROR
+        fi
+    fi
+
+    # Test that black is working
+    if ! "$black_exec" --version >/dev/null 2>&1; then
+        create_error_state "Black executable failed version check: $black_exec" "Black availability check"
         exit $EXIT_GENERAL_ERROR
     fi
+
+    if [[ "$QUIET_MODE" != "true" ]]; then
+        log_info "Black formatter found: $black_exec"
+    fi
+
+    # Export the resolved black path for use by other functions
+    export RESOLVED_BLACK_PATH="$black_exec"
+    return 0
 }
 
 get_file_checksum() {
@@ -1864,8 +1928,12 @@ get_file_checksum() {
 format_files_with_black() {
     local files_to_format=("$@")
     local files_changed=()
-    local black_cmd_args=("black")
-    
+    local black_cmd_args=()
+
+    # Use resolved black path (set by check_black_availability)
+    local black_exec="${RESOLVED_BLACK_PATH:-black}"
+    black_cmd_args=("$black_exec")
+
     if [[ ${#files_to_format[@]} -eq 0 ]]; then
         if [[ "$QUIET_MODE" != "true" ]]; then
             log_info "No files to format"
@@ -1873,7 +1941,7 @@ format_files_with_black() {
         export FORMATTED_FILES=()
         return 0
     fi
-    
+
     # Add user-specified black arguments
     if [[ ${#BLACK_ARGS[@]} -gt 0 ]]; then
         black_cmd_args+=("${BLACK_ARGS[@]}")
