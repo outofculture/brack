@@ -2233,30 +2233,21 @@ main_workflow() {
     workflow_start_time=$(get_timestamp_ms)
     
     if [[ "$DRY_RUN" == "true" ]]; then
-        log_info "DRY RUN: Complete workflow simulation"
+        log_info "DRY RUN: No git changes will be made"
         check_black_availability
         detect_and_validate_merge_base
         validate_and_categorize_files
-        prepare_formatting_branch
-        log_info "DRY RUN: Would format existing files in formatting branch"
-        format_existing_files
-        log_info "DRY RUN: Would commit formatting changes for existing files"
-        commit_formatting_changes
-        log_info "DRY RUN: Would start background GitHub push"
-        return_to_original_branch
-        log_info "DRY RUN: Would format new files in current branch"
-        format_new_files
-        log_info "DRY RUN: Would commit formatting changes for new files"
-        commit_formatting_changes
-        log_info "DRY RUN: Would merge formatting changes back to original branch"
-        log_info "DRY RUN: Would start background GitHub PR creation"
-        restore_working_directory || true
-        
+        log_info "DRY RUN: Would format ${#EXISTING_FILES[@]} existing file(s) in a new formatting branch"
+        log_info "DRY RUN: Would format ${#NEW_FILES[@]} new file(s) in the current branch"
+        if [[ ${#EXISTING_FILES[@]} -gt 0 ]]; then
+            log_info "DRY RUN: Would push formatting branch and open a PR"
+        fi
+
         local workflow_end_time
         workflow_end_time=$(get_timestamp_ms)
         local duration
         duration=$(calculate_duration "$workflow_start_time" "$workflow_end_time")
-        log_info "DRY RUN: Simulated workflow completed in ${duration}ms"
+        log_info "DRY RUN: Completed in ${duration}ms"
         return 0
     fi
 
