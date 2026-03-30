@@ -450,7 +450,7 @@ save_working_directory() {
 }
 
 restore_working_directory() {
-    if [[ "$STASH_CREATED" == "true" ]]; then
+    if [[ "${STASH_CREATED:-false}" == "true" ]]; then
         if [[ "$QUIET_MODE" != "true" ]]; then
             log_info "Restoring stashed changes..."
         fi
@@ -493,7 +493,7 @@ restore_working_directory() {
 }
 
 cleanup_stash_on_error() {
-    if [[ "$STASH_CREATED" == "true" && -n "$STASH_MESSAGE" ]]; then
+    if [[ "${STASH_CREATED:-false}" == "true" && -n "${STASH_MESSAGE:-}" ]]; then
         log_error "Emergency cleanup: attempting to restore stashed changes..."
         
         # Try to restore the stash

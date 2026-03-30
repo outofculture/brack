@@ -23,8 +23,8 @@ test_non_git_directory() {
     # Clear git repo root to force detection
     GIT_REPO_ROOT=""
     
-    # Should fail gracefully
-    if validate_git_repository 2>/dev/null; then
+    # Should fail gracefully — wrap in subshell so internal exit() doesn't kill the test
+    if (validate_git_repository 2>/dev/null); then
         echo -e "${RED}ASSERTION FAILED${NC}: Should fail outside git repository"
         cd "$original_dir"
         rm -rf "$temp_dir"
@@ -95,7 +95,8 @@ test_detached_head_detection() {
     # Set required variables for the function
     QUIET_MODE=true
     
-    if validate_not_detached_head 2>/dev/null; then
+    # Wrap in subshell so internal exit() doesn't kill the test
+    if (validate_not_detached_head 2>/dev/null); then
         # Return to main branch first
         git checkout main --quiet 2>/dev/null || true
         echo -e "${RED}ASSERTION FAILED${NC}: Should detect detached HEAD"
@@ -164,15 +165,15 @@ test_file_categorization_edge_cases() {
     local merge_base
     merge_base=$(git merge-base HEAD main)
     
-    # existing.py should exist at merge base
-    if check_file_existence_at_merge_base "$merge_base" "existing.py" 2>/dev/null; then
+    # existing.py should exist at merge base (args: file, merge_base)
+    if check_file_existence_at_merge_base "existing.py" "$merge_base" 2>/dev/null; then
         assert_true "true" "Existing file should be found at merge base"
     else
         assert_true "false" "Failed to find existing file at merge base"
     fi
-    
-    # new_file.py should not exist at merge base
-    if check_file_existence_at_merge_base "$merge_base" "new_file.py" 2>/dev/null; then
+
+    # new_file.py should not exist at merge base (args: file, merge_base)
+    if check_file_existence_at_merge_base "new_file.py" "$merge_base" 2>/dev/null; then
         assert_true "false" "New file should not exist at merge base"
     else
         assert_true "true" "New file correctly not found at merge base"
@@ -201,11 +202,17 @@ test_stash_with_no_changes() {
 }
 
 test_stash_with_changes() {
+    # Use real git so status --porcelain reflects actual changes
+    if declare -F git >/dev/null; then
+        unset -f git
+    fi
+
     # Create uncommitted changes
     echo "print('modified')" > modified.py
-    
+
     STASH_CREATED=false
-    
+    STASH_MESSAGE=""
+
     if save_working_directory 2>/dev/null; then
         assert_true "$STASH_CREATED" "Should create stash for dirty directory"
     else
@@ -303,8 +310,9 @@ test_emergency_cleanup() {
     # Setup state that needs cleanup
     echo "print('test')" > dirty.py
     STASH_CREATED=true
+    STASH_MESSAGE=""
     ORIGINAL_BRANCH="main"
-    
+
     # Create a stash to cleanup
     git stash push -m "Test stash" --quiet 2>/dev/null || true
     
@@ -320,6 +328,7 @@ test_rollback_mechanisms() {
     echo "print('rollback test')" > rollback.py
     git stash push -m "Rollback test" --quiet 2>/dev/null || true
     STASH_CREATED=true
+    STASH_MESSAGE=""
     
     # Test rollback
     cleanup_stash_on_error 2>/dev/null || true
@@ -333,22 +342,27 @@ test_rollback_mechanisms() {
 #=============================================================================
 
 test_performance_edge_cases() {
-    # Test with exactly 1000ms (boundary condition)
-    local start=1000000
-    local end=1001000  # Exactly 1000ms
-    
-    if validate_performance_timing $start $end 2>/dev/null; then
-        assert_true "false" "Should fail at exactly 1000ms boundary"
+    # validate_performance_timing(duration_ms, max_ms) returns 1 if duration > max
+
+    # Exactly at limit: 1000ms with max 1000ms should pass (not strictly over)
+    if validate_performance_timing 1000 1000 2>/dev/null; then
+        assert_true "true" "Should pass at exactly the limit (not strictly over)"
     else
-        assert_true "true" "Should fail at 1000ms boundary"
+        assert_true "false" "Should pass at exactly the limit"
     fi
-    
-    # Test with 999ms (just under boundary)
-    local under_end=1000999  # 999ms
-    if validate_performance_timing $start $under_end 2>/dev/null; then
-        assert_true "true" "Should pass just under 1000ms"
+
+    # One over limit: 1001ms with max 1000ms should fail
+    if validate_performance_timing 1001 1000 2>/dev/null; then
+        assert_true "false" "Should fail when 1ms over limit"
     else
-        assert_true "false" "Should pass just under 1000ms"
+        assert_true "true" "Correctly failed when over limit"
+    fi
+
+    # Under limit: 999ms with max 1000ms should pass
+    if validate_performance_timing 999 1000 2>/dev/null; then
+        assert_true "true" "Should pass just under limit"
+    else
+        assert_true "false" "Should pass just under limit"
     fi
 }
 
