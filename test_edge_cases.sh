@@ -257,6 +257,44 @@ test_branch_cleanup_on_error() {
     return 0
 }
 
+test_prepare_branch_stashes_before_checkout() {
+    # Use real git commands for this test so dirty working tree detection works
+    if declare -F git >/dev/null; then
+        unset -f git
+    fi
+    
+    git checkout -b axis-of-diagonevil --quiet
+    echo "print('formatting target')" > sample.py
+    git add sample.py
+    git commit -m "Add sample file" --quiet
+
+    QUIET_MODE=true
+    GIT_REPO_ROOT="$PWD"
+    CURRENT_BRANCH="axis-of-diagonevil"
+    MERGE_BASE=$(git merge-base HEAD main)
+    STASH_CREATED=false
+    STASH_MESSAGE=""
+
+    # Initial preparation should create the formatting branch while repo is clean
+    prepare_formatting_branch >/dev/null 2>&1
+    return_to_original_branch >/dev/null 2>&1
+
+    # Dirty working tree before reusing formatting branch
+    echo "print('dirty change')" >> sample.py
+    CURRENT_BRANCH="axis-of-diagonevil"
+    STASH_CREATED=false
+    STASH_MESSAGE=""
+
+    if prepare_formatting_branch >/dev/null 2>&1; then
+        local current_branch
+        current_branch=$(git branch --show-current)
+        assert_equals "$FORMATTING_BRANCH" "$current_branch" "Should switch to formatting branch after preparation"
+        assert_equals "true" "$STASH_CREATED" "Dirty working tree should be stashed before checkout"
+    else
+        assert_true "false" "prepare_formatting_branch should succeed with dirty working tree"
+    fi
+}
+
 #=============================================================================
 # EDGE CASE TESTS - Error Recovery
 #=============================================================================
@@ -385,6 +423,7 @@ main_edge_cases() {
     echo -e "${YELLOW}Testing Branch Operation Edge Cases${NC}"
     run_test "formatting_branch_already_exists" test_formatting_branch_already_exists
     run_test "branch_cleanup_on_error" test_branch_cleanup_on_error
+    run_test "prepare_branch_stashes_before_checkout" test_prepare_branch_stashes_before_checkout
     
     echo -e "${YELLOW}Testing Error Recovery${NC}"
     run_test "emergency_cleanup" test_emergency_cleanup

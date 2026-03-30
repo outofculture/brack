@@ -1008,6 +1008,12 @@ create_or_reuse_formatting_branch() {
     fi
 }
 
+prepare_formatting_branch() {
+    # Always stash before switching branches so checkout can't be blocked
+    save_working_directory || true
+    create_or_reuse_formatting_branch
+}
+
 # Branch merging functions
 merge_formatting_changes() {
     local formatting_branch="$FORMATTING_BRANCH"
@@ -2269,8 +2275,7 @@ main_workflow() {
         check_black_availability
         detect_and_validate_merge_base
         validate_and_categorize_files
-        create_or_reuse_formatting_branch
-        save_working_directory || true
+        prepare_formatting_branch
         log_info "DRY RUN: Would format existing files in formatting branch"
         format_existing_files
         log_info "DRY RUN: Would commit formatting changes for existing files"
@@ -2328,14 +2333,11 @@ main_workflow() {
         return 0
     fi
     
-    # Create or reuse formatting branch with error handling
-    if ! create_or_reuse_formatting_branch; then
-        emergency_cleanup "Failed to create or reuse formatting branch"
+    # Prepare formatting branch and ensure working directory is saved before switching
+    if ! prepare_formatting_branch; then
+        emergency_cleanup "Failed to prepare formatting branch"
         return 1
     fi
-    
-    # Save working directory changes (non-critical)
-    save_working_directory || true
     
     local phase_end_time
     phase_end_time=$(get_timestamp_ms)
