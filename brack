@@ -157,12 +157,6 @@ parse_arguments() {
                 fi
                 shift
                 ;;
-            --black-args=*)
-                # Support --black-args="--line-length 100 --target-version py38"
-                black_args_str="${1#*=}"
-                read -ra black_args <<< "$black_args_str"
-                shift
-                ;;
             --)
                 # Everything after -- goes to black
                 shift
@@ -356,9 +350,7 @@ validate_git_repository() {
 
 get_current_branch() {
     local branch_name
-    branch_name=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
-    
-    if [[ $? -ne 0 ]]; then
+    if ! branch_name=$(git rev-parse --abbrev-ref HEAD 2>/dev/null); then
         error_exit "Failed to determine current branch" $EXIT_GENERAL_ERROR
     fi
     
@@ -395,9 +387,7 @@ validate_git_environment() {
 # Git stashing functions
 detect_working_directory_changes() {
     local status_output
-    status_output=$(git status --porcelain 2>/dev/null)
-    
-    if [[ $? -ne 0 ]]; then
+    if ! status_output=$(git status --porcelain 2>/dev/null); then
         create_error_state "Failed to check git status" "Working directory detection"
         exit $EXIT_GENERAL_ERROR
     fi
@@ -528,13 +518,26 @@ cleanup_all_background_processes() {
 
     log_info "Cleaning up ${#BACKGROUND_PROCESSES[@]} background process(es)..."
 
-    # First try graceful termination
+    # Graceful termination first
     for process_name in "${!BACKGROUND_PROCESSES[@]}"; do
         kill_background_process "$process_name" false || true
     done
 
-    # Wait a moment for graceful termination
-    sleep 2
+    # Poll up to 500ms for processes to exit, then force kill
+    local waited=0
+    while [[ $waited -lt 10 ]]; do
+        local any_alive=false
+        for process_name in "${!BACKGROUND_PROCESSES[@]}"; do
+            local pid="${BACKGROUND_PROCESSES[$process_name]}"
+            if kill -0 "$pid" 2>/dev/null; then
+                any_alive=true
+                break
+            fi
+        done
+        [[ "$any_alive" == "false" ]] && break
+        sleep 0.05
+        waited=$((waited + 1))
+    done
 
     # Force kill any remaining processes
     for process_name in "${!BACKGROUND_PROCESSES[@]}"; do
@@ -633,9 +636,7 @@ calculate_merge_base() {
         exit $EXIT_GENERAL_ERROR
     fi
     
-    merge_base=$(git merge-base HEAD "$main_branch" 2>/dev/null)
-    
-    if [[ $? -ne 0 ]]; then
+    if ! merge_base=$(git merge-base HEAD "$main_branch" 2>/dev/null); then
         create_error_state "Failed to calculate merge-base between HEAD and $main_branch" "Merge base calculation"
         exit $EXIT_GENERAL_ERROR
     fi
@@ -1409,45 +1410,6 @@ cleanup_background_logging() {
                 fi
             fi
         fi
-    fi
-}
-
-# Test/mock functions for GitHub CLI
-mock_github_push() {
-    local branch="$1"
-    local delay="${2:-2}"  # Default 2 second delay to simulate network operation
-    
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Mock: Pushing branch $branch to GitHub..." >&2
-    sleep "$delay"
-    
-    # Simulate success/failure based on branch name (for testing)
-    if [[ "$branch" =~ "fail" ]]; then
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] Mock: GitHub push failed for branch $branch" >&2
-        return 1
-    else
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] Mock: GitHub push succeeded for branch $branch" >&2
-        return 0
-    fi
-}
-
-mock_github_pr_create() {
-    local branch="$1"
-    local title="$2"
-    local body="$3"
-    local delay="${4:-3}"  # Default 3 second delay to simulate API call
-    
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Mock: Creating PR for branch $branch..." >&2
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Mock: PR Title: $title" >&2
-    sleep "$delay"
-    
-    # Simulate success/failure based on branch name (for testing)
-    if [[ "$branch" =~ "fail" ]]; then
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] Mock: GitHub PR creation failed for branch $branch" >&2
-        return 1
-    else
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] Mock: GitHub PR created successfully for branch $branch" >&2
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] Mock: PR URL: https://github.com/test/repo/pull/123" >&2
-        return 0
     fi
 }
 
