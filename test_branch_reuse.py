@@ -9,8 +9,9 @@ def hello():
 def add_numbers(a, b):
     return a + b
 
-def multiply_numbers(x,y):
-    return x*y
+
+def multiply_numbers(x, y):
+    return x * y
 
 
 # This formatting will need black to fix spacing
