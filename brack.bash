@@ -1,0 +1,2493 @@
+#!/bin/bash
+
+# brack - Command-line tool for applying black formatting with clean feature branch diffs
+# Creates separate PRs for formatting changes while keeping feature branches clean
+
+set -euo pipefail
+
+# Global variables
+SCRIPT_NAME="$(basename "$0")"
+VERSION="1.0.0"
+ERROR_FILE="AUTO-BLACK-FORMATTING-ERROR"
+ORIGINAL_PWD="$PWD"
+
+# Exit codes
+EXIT_SUCCESS=0
+EXIT_INVALID_ARGS=1
+EXIT_NOT_GIT_REPO=2
+EXIT_ERROR_STATE=3
+EXIT_GENERAL_ERROR=4
+
+# Color codes for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Logging functions
+log_info() {
+    echo -e "${BLUE}[INFO]${NC} $*" >&2
+}
+
+log_warn() {
+    echo -e "${YELLOW}[WARN]${NC} $*" >&2
+}
+
+log_error() {
+    echo -e "${RED}[ERROR]${NC} $*" >&2
+}
+
+log_success() {
+    echo -e "${GREEN}[SUCCESS]${NC} $*" >&2
+}
+
+# Error handling
+error_exit() {
+    local exit_code=${2:-$EXIT_GENERAL_ERROR}
+    log_error "$1"
+    exit "$exit_code"
+}
+
+# Help/usage functionality
+show_help() {
+    cat << EOF
+$SCRIPT_NAME - Apply black formatting with clean feature branch diffs
+
+USAGE:
+    $SCRIPT_NAME [OPTIONS] [FILES...] [-- BLACK_ARGS...]
+
+DESCRIPTION:
+    Applies black formatting to Python files while maintaining clean feature branch diffs.
+    Creates separate PRs for formatting changes, allowing reviewers to see pure formatting
+    changes in isolation while keeping the developer's feature branch clean and formatted.
+
+OPTIONS:
+    -h, --help          Show this help message and exit
+    -v, --version       Show version information and exit
+    -q, --quiet         Run in quiet mode (minimal output for IDE integration)
+    --dry-run           Show what would be done without making changes
+    --cleanup           Clean up any existing error state files
+    --black-path PATH   Specify custom path to black executable
+
+ARGUMENTS:
+    FILES...            Python files to format (if not specified, formats all Python files)
+    -- BLACK_ARGS...    Pass additional arguments to black formatter (after --)
+
+EXAMPLES:
+    $SCRIPT_NAME                           # Format all Python files in the repository
+    $SCRIPT_NAME file1.py file2.py        # Format specific files
+    $SCRIPT_NAME --dry-run                # Preview what would be formatted
+    $SCRIPT_NAME --cleanup                # Clean up error state
+    $SCRIPT_NAME -- --line-length 100     # Format with custom line length
+    $SCRIPT_NAME file.py -- --target-version py38 --line-length 88
+    $SCRIPT_NAME --black-path /usr/local/bin/black  # Use custom black executable
+    $SCRIPT_NAME --black-path ./venv/bin/black -- --line-length 100
+
+WORKFLOW:
+    1. Detects files that need formatting
+    2. Creates formatting branch from merge-base with main
+    3. Applies black formatting to existing files in separate branch
+    4. Formats new files in current branch
+    5. Creates GitHub PR for formatting changes (background)
+    6. Merges formatting changes back to feature branch
+
+ERROR RECOVERY:
+    If the tool encounters errors, it creates an error state file that prevents
+    further runs until resolved. Use --cleanup to remove this file after
+    manually resolving any issues.
+
+REQUIREMENTS:
+    - Must be run from within a git repository
+    - Requires 'black' Python formatter to be installed
+    - Requires 'gh' GitHub CLI for PR operations
+    - Repository must have a main branch (main/master/origin variants)
+
+VERSION: $VERSION
+EOF
+}
+
+show_version() {
+    echo "$SCRIPT_NAME version $VERSION"
+}
+
+# Argument parsing
+parse_arguments() {
+    local quiet_mode=false
+    local dry_run=false
+    local cleanup_mode=false
+    local files=()
+    local black_args=()
+    local black_path=""
+
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -h|--help)
+                show_help
+                exit $EXIT_SUCCESS
+                ;;
+            -v|--version)
+                show_version
+                exit $EXIT_SUCCESS
+                ;;
+            -q|--quiet)
+                quiet_mode=true
+                shift
+                ;;
+            --dry-run)
+                dry_run=true
+                shift
+                ;;
+            --cleanup)
+                cleanup_mode=true
+                shift
+                ;;
+            --black-path)
+                if [[ -n "${2:-}" && ! "${2:-}" =~ ^- ]]; then
+                    black_path="$2"
+                    shift 2
+                else
+                    error_exit "--black-path requires a path argument" $EXIT_INVALID_ARGS
+                fi
+                ;;
+            --black-path=*)
+                black_path="${1#*=}"
+                if [[ -z "$black_path" ]]; then
+                    error_exit "--black-path requires a path argument" $EXIT_INVALID_ARGS
+                fi
+                shift
+                ;;
+            --)
+                # Everything after -- goes to black
+                shift
+                black_args=("$@")
+                break
+                ;;
+            -*)
+                error_exit "Unknown option: $1" $EXIT_INVALID_ARGS
+                ;;
+            *)
+                files+=("$1")
+                shift
+                ;;
+        esac
+    done
+
+    # Validate file arguments have .py extension
+    for file in "${files[@]}"; do
+        if [[ ! "$file" =~ \.py$ ]]; then
+            error_exit "Error: '$file' is not a Python file (must have .py extension)" $EXIT_INVALID_ARGS
+        fi
+        # Note: File existence will be validated after determining git repo root
+    done
+
+    # Export parsed arguments for use by other functions
+    export QUIET_MODE="$quiet_mode"
+    export DRY_RUN="$dry_run"
+    export CLEANUP_MODE="$cleanup_mode"
+    export FILES=("${files[@]}")
+    export BLACK_ARGS=("${black_args[@]}")
+    export BLACK_PATH="$black_path"
+    export FORMATTED_FILES=()
+}
+
+# Error state management functions
+get_error_file_path() {
+    if [[ -n "${GIT_REPO_ROOT:-}" ]]; then
+        echo "$GIT_REPO_ROOT/$ERROR_FILE"
+    else
+        echo "$ERROR_FILE"
+    fi
+}
+
+create_error_state() {
+    local error_message="$1"
+    local error_context="${2:-Unknown context}"
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    local error_file_path
+    error_file_path=$(get_error_file_path)
+    
+    cat > "$error_file_path" << EOF
+BRACK TOOL ERROR STATE
+======================
+Timestamp: $timestamp
+Context: $error_context
+Error: $error_message
+
+RECOVERY INSTRUCTIONS:
+1. Manually resolve the issue described above
+2. Verify your git repository is in a clean state:
+   - Check 'git status' for any uncommitted changes
+   - Ensure you're on the correct branch
+   - Look for any orphaned formatting branches that need cleanup
+3. Run 'brack --cleanup' to clear this error state
+4. Try running brack again
+
+If you continue to have issues, check for:
+- Uncommitted changes in formatting branches
+- Network connectivity for GitHub operations  
+- GitHub authentication with 'gh auth status'
+- Black formatter availability with 'black --version'
+
+For manual cleanup of formatting branches:
+git branch -D {branch-name}-auto-black-formatting
+
+Generated by: brack version $VERSION
+EOF
+
+    log_error "Error state created: $error_file_path"
+    log_error "Run 'brack --cleanup' after resolving the issue"
+}
+
+check_error_state() {
+    local error_file_path
+    error_file_path=$(get_error_file_path)
+    
+    if [[ -f "$error_file_path" ]]; then
+        log_error "Previous error state detected. Details:"
+        echo >&2
+        cat "$error_file_path" >&2
+        echo >&2
+        error_exit "Cannot proceed with error state present. Run 'brack --cleanup' after resolving the issue." $EXIT_ERROR_STATE
+    fi
+}
+
+cleanup_error_state() {
+    local error_file_path
+    error_file_path=$(get_error_file_path)
+    
+    if [[ -f "$error_file_path" ]]; then
+        if [[ "$QUIET_MODE" != "true" ]]; then
+            log_info "Removing error state file: $error_file_path"
+        fi
+        rm -f "$error_file_path"
+        log_success "Error state cleaned up successfully"
+        
+        # Provide additional cleanup guidance
+        log_info "Remember to also check for:"
+        log_info "  - Orphaned formatting branches (git branch | grep auto-black-formatting)"
+        log_info "  - Uncommitted changes (git status)"
+        log_info "  - Stashed changes (git stash list)"
+    else
+        log_info "No error state file found"
+    fi
+}
+
+# Git repository detection functions
+find_git_repo_root() {
+    local start_path="${1:-$PWD}"
+    
+    # Convert relative path to absolute
+    start_path=$(realpath "$start_path" 2>/dev/null || readlink -f "$start_path" 2>/dev/null || echo "$start_path")
+    
+    # If it's a file, get its directory
+    if [[ -f "$start_path" ]]; then
+        start_path=$(dirname "$start_path")
+    fi
+    
+    # Find git repo root from the given directory
+    local current_dir="$start_path"
+    while [[ "$current_dir" != "/" ]]; do
+        if [[ -d "$current_dir/.git" ]]; then
+            echo "$current_dir"
+            return 0
+        fi
+        current_dir=$(dirname "$current_dir")
+    done
+    
+    # Not found
+    return 1
+}
+
+determine_working_directory() {
+    local git_repo_root
+    
+    # If we have file arguments, use the first file's directory to find git repo
+    if [[ ${#FILES[@]} -gt 0 ]]; then
+        for file in "${FILES[@]}"; do
+            if git_repo_root=$(find_git_repo_root "$file"); then
+                export GIT_REPO_ROOT="$git_repo_root"
+                if [[ "$QUIET_MODE" != "true" ]]; then
+                    log_info "Git repository root (from file path): $git_repo_root"
+                fi
+                return 0
+            fi
+        done
+        error_exit "No git repository found for specified files" $EXIT_NOT_GIT_REPO
+    else
+        # No files specified, use current directory
+        if git_repo_root=$(find_git_repo_root "$PWD"); then
+            export GIT_REPO_ROOT="$git_repo_root"
+            if [[ "$QUIET_MODE" != "true" ]]; then
+                log_info "Git repository root (from current directory): $git_repo_root"
+            fi
+            return 0
+        else
+            error_exit "Not in a git repository: $PWD. Please run this tool from within a git repository." $EXIT_NOT_GIT_REPO
+        fi
+    fi
+}
+
+validate_git_repository() {
+    # Ensure we have determined the working directory first
+    if [[ -z "$GIT_REPO_ROOT" ]]; then
+        determine_working_directory
+    fi
+    
+    # Change to git repo root for all git operations
+    if ! cd "$GIT_REPO_ROOT" 2>/dev/null; then
+        error_exit "Failed to change to git repository root: $GIT_REPO_ROOT" $EXIT_NOT_GIT_REPO
+    fi
+    
+    if ! git rev-parse --git-dir >/dev/null 2>&1; then
+        error_exit "Not in a git repository: $GIT_REPO_ROOT. Please run this tool from within a git repository." $EXIT_NOT_GIT_REPO
+    fi
+    
+    if [[ "$QUIET_MODE" != "true" ]]; then
+        log_info "Git repository detected at: $GIT_REPO_ROOT"
+    fi
+}
+
+get_current_branch() {
+    local branch_name
+    if ! branch_name=$(git rev-parse --abbrev-ref HEAD 2>/dev/null); then
+        error_exit "Failed to determine current branch" $EXIT_GENERAL_ERROR
+    fi
+    
+    if [[ -z "$branch_name" ]]; then
+        error_exit "Unable to determine current branch name" $EXIT_GENERAL_ERROR
+    fi
+    
+    echo "$branch_name"
+}
+
+validate_not_detached_head() {
+    local current_branch
+    current_branch=$(get_current_branch)
+    
+    if [[ "$current_branch" == "HEAD" ]]; then
+        error_exit "Cannot run on detached HEAD. Please checkout a branch first." $EXIT_GENERAL_ERROR
+    fi
+    
+    if [[ "$QUIET_MODE" != "true" ]]; then
+        log_info "Current branch: $current_branch"
+    fi
+    
+    # Export for use by other functions
+    export CURRENT_BRANCH="$current_branch"
+}
+
+# Git repository validation workflow
+validate_git_environment() {
+    determine_working_directory
+    validate_git_repository
+    validate_not_detached_head
+}
+
+# Git stashing functions
+detect_working_directory_changes() {
+    local status_output
+    if ! status_output=$(git status --porcelain 2>/dev/null); then
+        create_error_state "Failed to check git status" "Working directory detection"
+        exit $EXIT_GENERAL_ERROR
+    fi
+    
+    if [[ -n "$status_output" ]]; then
+        if [[ "$QUIET_MODE" != "true" ]]; then
+            log_info "Working directory has uncommitted changes"
+        fi
+        return 0  # Changes detected
+    else
+        if [[ "$QUIET_MODE" != "true" ]]; then
+            log_info "Working directory is clean"
+        fi
+        return 1  # No changes
+    fi
+}
+
+save_working_directory() {
+    local stash_message="brack-auto-stash-$(date +%Y%m%d-%H%M%S)"
+    
+    if detect_working_directory_changes; then
+        if [[ "$QUIET_MODE" != "true" ]]; then
+            log_info "Stashing working directory changes..."
+        fi
+        
+        if ! git stash push -u -m "$stash_message" >/dev/null 2>&1; then
+            create_error_state "Failed to stash working directory changes" "Git stashing"
+            exit $EXIT_GENERAL_ERROR
+        fi
+        
+        # Verify stash was created by checking if working directory is now clean
+        if detect_working_directory_changes; then
+            create_error_state "Stash operation failed - working directory still has changes" "Git stashing verification"
+            exit $EXIT_GENERAL_ERROR
+        fi
+        
+        # Export stash info for later restoration
+        export STASH_CREATED="true"
+        export STASH_MESSAGE="$stash_message"
+        
+        if [[ "$QUIET_MODE" != "true" ]]; then
+            log_success "Working directory stashed successfully"
+        fi
+        return 0
+    else
+        # No changes to stash
+        export STASH_CREATED="false"
+        return 1
+    fi
+}
+
+restore_working_directory() {
+    if [[ "${STASH_CREATED:-false}" == "true" ]]; then
+        if [[ "$QUIET_MODE" != "true" ]]; then
+            log_info "Restoring stashed changes..."
+        fi
+        
+        # Check if our stash still exists
+        if ! git stash list | grep -q "$STASH_MESSAGE"; then
+            log_warn "Expected stash '$STASH_MESSAGE' not found in stash list"
+            return 1
+        fi
+        
+        # Pop the stash
+        if ! git stash pop >/dev/null 2>&1; then
+            log_error "Failed to restore stashed changes - you may have merge conflicts"
+            log_error "Manual recovery: git stash list (look for '$STASH_MESSAGE')"
+            log_error "Then: git stash apply stash@{N} (where N is the stash index)"
+            create_error_state "Failed to restore stashed changes from '$STASH_MESSAGE'" "Git stash restoration"
+            exit $EXIT_GENERAL_ERROR
+        fi
+        
+        # Verify stash was applied
+        if ! detect_working_directory_changes; then
+            log_warn "Stash restored but no changes detected - this may be normal if stash only had staged changes"
+        fi
+        
+        if [[ "$QUIET_MODE" != "true" ]]; then
+            log_success "Working directory changes restored successfully"
+        fi
+        
+        # Clear stash flags
+        export STASH_CREATED="false"
+        export STASH_MESSAGE=""
+        return 0
+    else
+        # No stash to restore
+        if [[ "$QUIET_MODE" != "true" ]]; then
+            log_info "No stash to restore"
+        fi
+        return 1
+    fi
+}
+
+cleanup_stash_on_error() {
+    if [[ "${STASH_CREATED:-false}" == "true" && -n "${STASH_MESSAGE:-}" ]]; then
+        log_error "Emergency cleanup: attempting to restore stashed changes..."
+        
+        # Try to restore the stash
+        if git stash list | grep -q "$STASH_MESSAGE"; then
+            if git stash pop >/dev/null 2>&1; then
+                log_success "Successfully restored stashed changes during cleanup"
+                export STASH_CREATED="false"
+                export STASH_MESSAGE=""
+            else
+                log_error "Failed to restore stash during cleanup"
+                log_error "MANUAL RECOVERY REQUIRED:"
+                log_error "  1. Check stash list: git stash list"
+                log_error "  2. Find stash: $STASH_MESSAGE"
+                log_error "  3. Apply manually: git stash apply stash@{N}"
+                create_error_state "Failed to restore stash '$STASH_MESSAGE' during error cleanup" "Emergency stash cleanup"
+            fi
+        else
+            log_warn "Stash '$STASH_MESSAGE' not found during cleanup - may have been already applied"
+            export STASH_CREATED="false"
+            export STASH_MESSAGE=""
+        fi
+    fi
+}
+
+cleanup_all_background_processes() {
+    if [[ ${#BACKGROUND_PROCESSES[@]} -eq 0 ]]; then
+        if [[ "$QUIET_MODE" != "true" ]]; then
+            log_info "No background processes to clean up"
+        fi
+        return 0
+    fi
+
+    log_info "Cleaning up ${#BACKGROUND_PROCESSES[@]} background process(es)..."
+
+    # Graceful termination first
+    for process_name in "${!BACKGROUND_PROCESSES[@]}"; do
+        kill_background_process "$process_name" false || true
+    done
+
+    # Poll up to 500ms for processes to exit, then force kill
+    local waited=0
+    while [[ $waited -lt 10 ]]; do
+        local any_alive=false
+        for process_name in "${!BACKGROUND_PROCESSES[@]}"; do
+            local pid="${BACKGROUND_PROCESSES[$process_name]}"
+            if kill -0 "$pid" 2>/dev/null; then
+                any_alive=true
+                break
+            fi
+        done
+        [[ "$any_alive" == "false" ]] && break
+        sleep 0.05
+        waited=$((waited + 1))
+    done
+
+    # Force kill any remaining processes
+    for process_name in "${!BACKGROUND_PROCESSES[@]}"; do
+        kill_background_process "$process_name" true || true
+    done
+
+    # Clear the array
+    BACKGROUND_PROCESSES=()
+
+    if [[ "$QUIET_MODE" != "true" ]]; then
+        log_success "Background process cleanup completed"
+    fi
+}
+
+# Comprehensive error cleanup function
+emergency_cleanup() {
+    local error_context="${1:-Unknown error context}"
+    
+    log_error "Performing emergency cleanup due to: $error_context"
+    
+    # 1. Clean up background processes
+    cleanup_all_background_processes
+
+    # 2. Try to restore stashed changes
+    cleanup_stash_on_error
+    
+    # 3. Try to return to original branch
+    if [[ -n "$ORIGINAL_BRANCH" ]]; then
+        local current_branch
+        current_branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
+        
+        if [[ "$current_branch" != "$ORIGINAL_BRANCH" ]]; then
+            log_error "Attempting to return to original branch: $ORIGINAL_BRANCH"
+            
+            # If we're in a merge state, try to abort first
+            if [[ -f ".git/MERGE_HEAD" ]]; then
+                log_error "Aborting ongoing merge..."
+                git merge --abort >/dev/null 2>&1 || true
+            fi
+            
+            if git checkout "$ORIGINAL_BRANCH" >/dev/null 2>&1; then
+                log_success "Returned to original branch during cleanup"
+            else
+                log_error "Failed to return to original branch during cleanup"
+                log_error "Manual recovery: git checkout $ORIGINAL_BRANCH"
+            fi
+        fi
+    fi
+    
+    # 4. Provide guidance for formatting branch cleanup
+    if [[ -n "$FORMATTING_BRANCH" ]]; then
+        log_error "Formatting branch '$FORMATTING_BRANCH' may need manual cleanup"
+        log_error "To clean up: git branch -D $FORMATTING_BRANCH"
+    fi
+    
+    # 5. Clean up background process logging
+    cleanup_background_logging
+    
+    log_error "Emergency cleanup completed. Check the error state file for details."
+}
+
+# Add signal handlers for emergency cleanup
+setup_signal_handlers() {
+    trap 'emergency_cleanup "Script interrupted"; cleanup_all_background_processes; exit 130' INT TERM
+}
+
+cleanup_signal_handlers() {
+    trap - INT TERM
+}
+
+# Merge base detection functions
+detect_main_branch() {
+    local main_branch_candidates=("main" "master" "origin/main" "origin/master")
+    
+    for branch in "${main_branch_candidates[@]}"; do
+        if git rev-parse --verify "$branch" >/dev/null 2>&1; then
+            if [[ "$QUIET_MODE" != "true" ]]; then
+                log_info "Detected main branch: $branch"
+            fi
+            echo "$branch"
+            return 0
+        fi
+    done
+    
+    # No main branch found
+    create_error_state "No main branch found. Tried: ${main_branch_candidates[*]}" "Main branch detection"
+    exit $EXIT_GENERAL_ERROR
+}
+
+calculate_merge_base() {
+    local main_branch="$1"
+    local merge_base
+    
+    if [[ -z "$main_branch" ]]; then
+        create_error_state "Main branch not provided for merge-base calculation" "Merge base calculation"
+        exit $EXIT_GENERAL_ERROR
+    fi
+    
+    if ! merge_base=$(git merge-base HEAD "$main_branch" 2>/dev/null); then
+        create_error_state "Failed to calculate merge-base between HEAD and $main_branch" "Merge base calculation"
+        exit $EXIT_GENERAL_ERROR
+    fi
+    
+    if [[ -z "$merge_base" ]]; then
+        create_error_state "Merge-base calculation returned empty result for HEAD and $main_branch" "Merge base calculation"
+        exit $EXIT_GENERAL_ERROR
+    fi
+    
+    echo "$merge_base"
+}
+
+validate_merge_base() {
+    local merge_base="$1"
+    
+    if [[ -z "$merge_base" ]]; then
+        create_error_state "Merge-base commit hash not provided for validation" "Merge base validation"
+        exit $EXIT_GENERAL_ERROR
+    fi
+    
+    # Verify the commit exists and is valid
+    if ! git rev-parse --verify "$merge_base" >/dev/null 2>&1; then
+        create_error_state "Merge-base commit '$merge_base' does not exist or is invalid" "Merge base validation"
+        exit $EXIT_GENERAL_ERROR
+    fi
+    
+    # Check if merge-base is an ancestor of HEAD
+    if ! git merge-base --is-ancestor "$merge_base" HEAD 2>/dev/null; then
+        create_error_state "Merge-base commit '$merge_base' is not an ancestor of current HEAD" "Merge base validation"
+        exit $EXIT_GENERAL_ERROR
+    fi
+    
+    if [[ "$QUIET_MODE" != "true" ]]; then
+        log_info "Merge-base validated: $merge_base"
+    fi
+    
+    return 0
+}
+
+detect_and_validate_merge_base() {
+    local main_branch merge_base
+    
+    # Detect main branch
+    main_branch=$(detect_main_branch)
+    export MAIN_BRANCH="$main_branch"
+    
+    # Calculate merge-base
+    merge_base=$(calculate_merge_base "$main_branch")
+    export MERGE_BASE="$merge_base"
+    
+    # Validate merge-base
+    validate_merge_base "$merge_base"
+    
+    if [[ "$QUIET_MODE" != "true" ]]; then
+        log_success "Merge-base detection completed successfully"
+        log_info "Main branch: $MAIN_BRANCH"
+        log_info "Merge-base: $MERGE_BASE"
+    fi
+}
+
+# File existence validation functions
+discover_python_files() {
+    local files=()
+    
+    if [[ ${#FILES[@]} -gt 0 ]]; then
+        # Convert specified files to relative paths from git repo root
+        for file in "${FILES[@]}"; do
+            # First, check if the file exists from the original working directory
+            if [[ ! -f "$ORIGINAL_PWD/$file" ]] && [[ ! -f "$file" ]]; then
+                create_error_state "File '$file' does not exist" "Python file validation"
+                exit $EXIT_GENERAL_ERROR
+            fi
+            
+            # Convert to absolute path from original working directory
+            local abs_path
+            if [[ "$file" = /* ]]; then
+                # Already absolute
+                abs_path="$file"
+            else
+                # Make absolute from original working directory
+                abs_path="$ORIGINAL_PWD/$file"
+            fi
+            
+            # Normalize the path
+            abs_path=$(realpath "$abs_path" 2>/dev/null || readlink -f "$abs_path" 2>/dev/null || echo "$abs_path")
+            
+            # Convert to relative path from git repo root
+            if [[ "$abs_path" == "$GIT_REPO_ROOT"/* ]]; then
+                local rel_path="${abs_path#$GIT_REPO_ROOT/}"
+                files+=("$rel_path")
+            elif [[ "$abs_path" == "$GIT_REPO_ROOT" ]]; then
+                # File is exactly the git repo root (shouldn't happen for .py files)
+                files+=(".")
+            else
+                # File is outside git repo
+                create_error_state "File '$file' (resolved to '$abs_path') is outside the git repository '$GIT_REPO_ROOT'" "Python file validation"
+                exit $EXIT_GENERAL_ERROR
+            fi
+        done
+    else
+        # Discover all Python files in the repository
+        while IFS= read -r -d '' file; do
+            files+=("$file")
+        done < <(find . -name "*.py" -type f -print0 2>/dev/null)
+        
+        if [[ ${#files[@]} -eq 0 ]]; then
+            create_error_state "No Python files found in repository" "Python file discovery"
+            exit $EXIT_GENERAL_ERROR
+        fi
+    fi
+    
+    # Validate all files are Python files and exist
+    for file in "${files[@]}"; do
+        if [[ ! "$file" =~ \.py$ ]]; then
+            create_error_state "File '$file' is not a Python file (must have .py extension)" "Python file validation"
+            exit $EXIT_GENERAL_ERROR
+        fi
+        
+        if [[ ! -f "$file" ]]; then
+            create_error_state "Python file '$file' does not exist" "Python file validation"
+            exit $EXIT_GENERAL_ERROR
+        fi
+    done
+    
+    if [[ "$QUIET_MODE" != "true" ]]; then
+        log_info "Discovered ${#files[@]} Python file(s)"
+    fi
+    
+    # Return files as newline-separated string
+    printf '%s\n' "${files[@]}"
+}
+
+check_file_existence_at_merge_base() {
+    local file="$1"
+    local merge_base="$2"
+    
+    if [[ -z "$file" || -z "$merge_base" ]]; then
+        create_error_state "File or merge-base not provided for existence check" "File existence validation"
+        exit $EXIT_GENERAL_ERROR
+    fi
+    
+    # Use git show to check if file exists at merge-base
+    if git show "$merge_base:$file" >/dev/null 2>&1; then
+        return 0  # File exists at merge-base
+    else
+        return 1  # File does not exist at merge-base (new file)
+    fi
+}
+
+categorize_files() {
+    local merge_base="$1"
+    local existing_files=()
+    local new_files=()
+    
+    if [[ -z "$merge_base" ]]; then
+        create_error_state "Merge-base not provided for file categorization" "File categorization"
+        exit $EXIT_GENERAL_ERROR
+    fi
+    
+    # Get list of Python files
+    local python_files
+    mapfile -t python_files < <(discover_python_files)
+    
+    # Categorize each file
+    for file in "${python_files[@]}"; do
+        if check_file_existence_at_merge_base "$file" "$merge_base"; then
+            existing_files+=("$file")
+            if [[ "$QUIET_MODE" != "true" ]]; then
+                log_info "Existing file: $file"
+            fi
+        else
+            new_files+=("$file")
+            if [[ "$QUIET_MODE" != "true" ]]; then
+                log_info "New file: $file"
+            fi
+        fi
+    done
+    
+    # Export categorized files for use by other functions
+    export EXISTING_FILES=("${existing_files[@]}")
+    export NEW_FILES=("${new_files[@]}")
+    
+    if [[ "$QUIET_MODE" != "true" ]]; then
+        log_success "File categorization completed"
+        log_info "Existing files (${#existing_files[@]}): ${existing_files[*]:-none}"
+        log_info "New files (${#new_files[@]}): ${new_files[*]:-none}"
+    fi
+    
+    # Validate we have some files to process
+    if [[ ${#existing_files[@]} -eq 0 && ${#new_files[@]} -eq 0 ]]; then
+        create_error_state "No Python files found to process" "File categorization"
+        exit $EXIT_GENERAL_ERROR
+    fi
+}
+
+validate_and_categorize_files() {
+    local merge_base="$MERGE_BASE"
+    
+    if [[ -z "$merge_base" ]]; then
+        create_error_state "Merge-base not available for file validation" "File validation"
+        exit $EXIT_GENERAL_ERROR
+    fi
+    
+    categorize_files "$merge_base"
+    
+    if [[ "$QUIET_MODE" != "true" ]]; then
+        log_success "File validation and categorization completed successfully"
+    fi
+}
+
+# Branch creation and management functions
+generate_formatting_branch_name() {
+    local current_branch="$CURRENT_BRANCH"
+    
+    if [[ -z "$current_branch" ]]; then
+        create_error_state "Current branch not available for formatting branch name generation" "Branch naming"
+        exit $EXIT_GENERAL_ERROR
+    fi
+    
+    local formatting_branch="${current_branch}-auto-black-formatting"
+    echo "$formatting_branch"
+}
+
+check_formatting_branch_exists() {
+    local branch_name="$1"
+    
+    if [[ -z "$branch_name" ]]; then
+        create_error_state "Branch name not provided for existence check" "Branch existence check"
+        exit $EXIT_GENERAL_ERROR
+    fi
+    
+    if git rev-parse --verify "$branch_name" >/dev/null 2>&1; then
+        return 0  # Branch exists
+    else
+        return 1  # Branch does not exist
+    fi
+}
+
+create_formatting_branch() {
+    local branch_name="$1"
+    local merge_base="$2"
+    
+    if [[ -z "$branch_name" || -z "$merge_base" ]]; then
+        create_error_state "Branch name or merge-base not provided for branch creation" "Branch creation"
+        exit $EXIT_GENERAL_ERROR
+    fi
+    
+    if [[ "$QUIET_MODE" != "true" ]]; then
+        log_info "Creating formatting branch: $branch_name"
+    fi
+    
+    if ! git checkout -b "$branch_name" "$merge_base" >/dev/null 2>&1; then
+        create_error_state "Failed to create formatting branch '$branch_name' from merge-base '$merge_base'" "Branch creation"
+        exit $EXIT_GENERAL_ERROR
+    fi
+    
+    if [[ "$QUIET_MODE" != "true" ]]; then
+        log_success "Created formatting branch: $branch_name"
+    fi
+}
+
+reuse_formatting_branch() {
+    local branch_name="$1"
+    
+    if [[ -z "$branch_name" ]]; then
+        create_error_state "Branch name not provided for reuse" "Branch reuse"
+        exit $EXIT_GENERAL_ERROR
+    fi
+    
+    if [[ "$QUIET_MODE" != "true" ]]; then
+        log_info "Reusing existing formatting branch: $branch_name"
+    fi
+    
+    if ! git checkout "$branch_name" >/dev/null 2>&1; then
+        create_error_state "Failed to checkout existing formatting branch '$branch_name'" "Branch reuse"
+        exit $EXIT_GENERAL_ERROR
+    fi
+    
+    if [[ "$QUIET_MODE" != "true" ]]; then
+        log_success "Switched to existing formatting branch: $branch_name"
+    fi
+}
+
+return_to_original_branch() {
+    local original_branch="$ORIGINAL_BRANCH"
+    
+    if [[ -z "$original_branch" ]]; then
+        log_warn "Original branch not available for restoration"
+        return 1
+    fi
+    
+    if [[ "$QUIET_MODE" != "true" ]]; then
+        log_info "Returning to original branch: $original_branch"
+    fi
+    
+    if ! git checkout "$original_branch" >/dev/null 2>&1; then
+        log_error "Failed to return to original branch '$original_branch'"
+        create_error_state "Failed to return to original branch '$original_branch'" "Branch restoration"
+        exit $EXIT_GENERAL_ERROR
+    fi
+    
+    if [[ "$QUIET_MODE" != "true" ]]; then
+        log_success "Returned to original branch: $original_branch"
+    fi
+}
+
+cleanup_formatting_branch() {
+    local formatting_branch="$FORMATTING_BRANCH"
+    
+    if [[ -z "$formatting_branch" ]]; then
+        if [[ "$QUIET_MODE" != "true" ]]; then
+            log_info "No formatting branch to clean up"
+        fi
+        return 0
+    fi
+    
+    # First return to original branch
+    return_to_original_branch
+    
+    # Check if formatting branch exists and delete it
+    if check_formatting_branch_exists "$formatting_branch"; then
+        if [[ "$QUIET_MODE" != "true" ]]; then
+            log_info "Cleaning up formatting branch: $formatting_branch"
+        fi
+        
+        if git branch -D "$formatting_branch" >/dev/null 2>&1; then
+            if [[ "$QUIET_MODE" != "true" ]]; then
+                log_success "Cleaned up formatting branch: $formatting_branch"
+            fi
+        else
+            log_error "Failed to delete formatting branch '$formatting_branch'"
+            log_error "Manual cleanup required: git branch -D $formatting_branch"
+        fi
+    fi
+    
+    # Clear formatting branch variable
+    export FORMATTING_BRANCH=""
+}
+
+create_or_reuse_formatting_branch() {
+    local merge_base="$MERGE_BASE"
+    local current_branch="$CURRENT_BRANCH"
+    
+    if [[ -z "$merge_base" || -z "$current_branch" ]]; then
+        create_error_state "Merge-base or current branch not available for formatting branch creation" "Branch management"
+        exit $EXIT_GENERAL_ERROR
+    fi
+    
+    # Store original branch for cleanup
+    export ORIGINAL_BRANCH="$current_branch"
+    
+    # Generate formatting branch name
+    local formatting_branch
+    formatting_branch=$(generate_formatting_branch_name)
+    export FORMATTING_BRANCH="$formatting_branch"
+    
+    if [[ "$QUIET_MODE" != "true" ]]; then
+        log_info "Formatting branch: $formatting_branch"
+    fi
+    
+    # Check if formatting branch already exists
+    if check_formatting_branch_exists "$formatting_branch"; then
+        reuse_formatting_branch "$formatting_branch"
+    else
+        create_formatting_branch "$formatting_branch" "$merge_base"
+    fi
+    
+    if [[ "$QUIET_MODE" != "true" ]]; then
+        log_success "Formatting branch setup completed"
+    fi
+}
+
+prepare_formatting_branch() {
+    # Always stash before switching branches so checkout can't be blocked
+    save_working_directory || true
+    create_or_reuse_formatting_branch
+}
+
+# Branch merging functions
+merge_formatting_changes() {
+    local formatting_branch="$FORMATTING_BRANCH"
+    local original_branch="$ORIGINAL_BRANCH"
+    
+    if [[ -z "$formatting_branch" || -z "$original_branch" ]]; then
+        create_error_state "Formatting branch or original branch not available for merge" "Branch merging"
+        exit $EXIT_GENERAL_ERROR
+    fi
+    
+    # Ensure we're on the original branch
+    local current_branch
+    current_branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
+    
+    if [[ "$current_branch" != "$original_branch" ]]; then
+        if [[ "$QUIET_MODE" != "true" ]]; then
+            log_info "Switching to original branch for merge: $original_branch"
+        fi
+        
+        if ! git checkout "$original_branch" >/dev/null 2>&1; then
+            create_error_state "Failed to switch to original branch '$original_branch' for merge" "Branch merging"
+            exit $EXIT_GENERAL_ERROR
+        fi
+    fi
+    
+    if [[ "$QUIET_MODE" != "true" ]]; then
+        log_info "Merging formatting changes from $formatting_branch into $original_branch"
+    fi
+    
+    # Attempt the merge
+    local merge_output_file
+    merge_output_file=$(mktemp)
+    
+    if git merge --no-ff -m "Merge formatting changes from $formatting_branch" "$formatting_branch" >"$merge_output_file" 2>&1; then
+        # Merge succeeded
+        if [[ "$QUIET_MODE" != "true" ]]; then
+            log_success "Successfully merged formatting changes"
+        fi
+        rm -f "$merge_output_file"
+        return 0
+    else
+        # Merge failed - likely due to conflicts
+        local merge_output
+        merge_output=$(cat "$merge_output_file")
+        rm -f "$merge_output_file"
+        
+        log_error "Merge failed with conflicts or other issues"
+        log_error "Git merge output: $merge_output"
+        
+        # Check if we're in a merge state
+        if [[ -f ".git/MERGE_HEAD" ]]; then
+            log_error "Repository is in merge state with conflicts"
+            handle_merge_conflicts
+        else
+            create_error_state "Merge failed: $merge_output" "Branch merging"
+            exit $EXIT_GENERAL_ERROR
+        fi
+        
+        return 1
+    fi
+}
+
+handle_merge_conflicts() {
+    log_info "Merge conflicts detected. Resolving automatically..."
+    log_info "Taking coding branch changes (ignoring formatting branch) since we'll re-run black anyway"
+    
+    # Always take our changes (the coding branch) and ignore theirs (formatting branch)
+    if git checkout --ours . >/dev/null 2>&1; then
+        log_info "Resolved conflicts by keeping coding branch changes"
+        
+        # Stage all resolved files
+        if git add . >/dev/null 2>&1; then
+            log_info "Staged resolved changes"
+            
+            # Complete the merge with a commit explaining the resolution strategy
+            if git commit -m "Resolve merge conflicts by keeping coding branch changes
+
+The formatting branch changes are ignored since black will be re-applied
+to the final result anyway, making the formatting branch content irrelevant." >/dev/null 2>&1; then
+                log_info "Merge conflicts resolved successfully"
+                return 0
+            else
+                log_error "Failed to commit merge conflict resolution"
+                create_error_state "Failed to commit after resolving merge conflicts" "Merge conflict resolution"
+                exit $EXIT_GENERAL_ERROR
+            fi
+        else
+            log_error "Failed to stage resolved changes"
+            create_error_state "Failed to stage files after resolving merge conflicts" "Merge conflict resolution"
+            exit $EXIT_GENERAL_ERROR
+        fi
+    else
+        log_error "Failed to resolve conflicts with 'git checkout --ours .'"
+        log_error "MANUAL RECOVERY REQUIRED:"
+        log_error "  1. Check repository status: git status"
+        log_error "  2. Resolve conflicts manually or abort merge: git merge --abort"
+        log_error "  3. Restore stashed changes if needed: git stash list"
+        log_error "  4. Clean up formatting branch: git branch -D $FORMATTING_BRANCH"
+        log_error "  5. Run: brack --cleanup"
+        
+        create_error_state "Failed to auto-resolve merge conflicts - repository in inconsistent state" "Merge conflict resolution"
+        exit $EXIT_GENERAL_ERROR
+    fi
+}
+
+validate_merge_success() {
+    local formatting_branch="$FORMATTING_BRANCH"
+    
+    if [[ -z "$formatting_branch" ]]; then
+        log_warn "Formatting branch not available for merge validation"
+        return 1
+    fi
+    
+    # Check that we're not in a merge state
+    if [[ -f ".git/MERGE_HEAD" ]]; then
+        log_error "Repository still in merge state after supposed successful merge"
+        return 1
+    fi
+    
+    # Don't validate specific commit message - if merge succeeded, it succeeded
+    # This allows manual merges with different commit messages
+    if [[ "$QUIET_MODE" != "true" ]]; then
+        log_success "Merge validation completed successfully"
+    fi
+    
+    return 0
+}
+
+cleanup_after_successful_merge() {
+    local formatting_branch="$FORMATTING_BRANCH"
+    
+    if [[ -z "$formatting_branch" ]]; then
+        if [[ "$QUIET_MODE" != "true" ]]; then
+            log_info "No formatting branch to clean up after merge"
+        fi
+        return 0
+    fi
+    
+    # Keep the formatting branch for reuse on subsequent runs
+    # Only clean up the variable reference, not the actual branch
+    if [[ "$QUIET_MODE" != "true" ]]; then
+        log_info "Preserving formatting branch for reuse: $formatting_branch"
+    fi
+    
+    # Clear formatting branch variable but keep the actual git branch
+    export FORMATTING_BRANCH=""
+}
+
+merge_and_cleanup_formatting_branch() {
+    if [[ -z "$FORMATTING_BRANCH" ]]; then
+        if [[ "$QUIET_MODE" != "true" ]]; then
+            log_info "No formatting branch to merge"
+        fi
+        return 0
+    fi
+    
+    # Attempt the merge
+    if merge_formatting_changes; then
+        # Merge succeeded, validate and cleanup
+        if validate_merge_success; then
+            cleanup_after_successful_merge
+            return 0
+        else
+            log_warn "Merge completed but validation failed"
+            return 1
+        fi
+    else
+        # Merge failed - error handling already done in merge_formatting_changes
+        return 1
+    fi
+}
+
+# Background GitHub Operations functions
+# Global variables for background process management
+declare -A BACKGROUND_PROCESSES=()
+BACKGROUND_ERROR_LOG="background_errors.log"
+
+get_background_log_path() {
+    if [[ -n "${GIT_REPO_ROOT:-}" ]]; then
+        echo "$GIT_REPO_ROOT/$BACKGROUND_ERROR_LOG"
+    else
+        echo "$BACKGROUND_ERROR_LOG"
+    fi
+}
+
+# Background process framework
+start_background_process() {
+    local process_name="$1"
+    local command_func="$2"
+    shift 2
+    local args=("$@")
+    
+    if [[ -z "$process_name" || -z "$command_func" ]]; then
+        log_error "Background process name and command function required"
+        return 1
+    fi
+    
+    if [[ "$QUIET_MODE" != "true" ]]; then
+        log_info "Starting background process: $process_name"
+    fi
+    
+    # Create background process
+    (
+        # Set up error logging for background process
+        exec 2>>"$(get_background_log_path)"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting background process: $process_name" >&2
+        
+        # Call the command function with arguments
+        if "$command_func" "${args[@]}"; then
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] Background process completed successfully: $process_name" >&2
+        else
+            local exit_code=$?
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] Background process failed with exit code $exit_code: $process_name" >&2
+            
+            # Log detailed error to the main error file
+            {
+                echo "BACKGROUND PROCESS ERROR"
+                echo "========================"
+                echo "Process: $process_name"
+                echo "Timestamp: $(date '+%Y-%m-%d %H:%M:%S')"
+                echo "Exit Code: $exit_code"
+                echo "Command: $command_func ${args[*]}"
+                echo ""
+                echo "See $(get_background_log_path) for detailed background process logs."
+                echo ""
+            } >> "$(get_error_file_path)"
+            
+            exit $exit_code
+        fi
+    ) &
+    
+    local bg_pid=$!
+    BACKGROUND_PROCESSES["$process_name"]=$bg_pid
+    
+    if [[ "$QUIET_MODE" != "true" ]]; then
+        log_success "Background process started: $process_name (PID: $bg_pid)"
+    fi
+    
+    return 0
+}
+
+wait_for_background_process() {
+    local process_name="$1"
+    local timeout_seconds="${2:-30}"  # Default 30 second timeout
+    
+    if [[ -z "$process_name" ]]; then
+        log_error "Process name required for wait operation"
+        return 1
+    fi
+    
+    if [[ -z "${BACKGROUND_PROCESSES[$process_name]:-}" ]]; then
+        log_warn "No background process found with name: $process_name"
+        return 1
+    fi
+    
+    local bg_pid="${BACKGROUND_PROCESSES[$process_name]}"
+    
+    if [[ "$QUIET_MODE" != "true" ]]; then
+        log_info "Waiting for background process: $process_name (PID: $bg_pid)"
+    fi
+    
+    # Wait for process with timeout
+    local count=0
+    while kill -0 "$bg_pid" 2>/dev/null; do
+        if [[ $count -ge $timeout_seconds ]]; then
+            log_warn "Background process timeout after ${timeout_seconds}s: $process_name"
+            return 124  # Timeout exit code
+        fi
+        sleep 1
+        ((count++))
+    done
+    
+    # Check exit status
+    wait "$bg_pid"
+    local exit_code=$?
+    
+    if [[ $exit_code -eq 0 ]]; then
+        if [[ "$QUIET_MODE" != "true" ]]; then
+            log_success "Background process completed: $process_name"
+        fi
+    else
+        log_error "Background process failed with exit code $exit_code: $process_name"
+    fi
+    
+    # Remove from tracking
+    unset BACKGROUND_PROCESSES["$process_name"]
+    
+    return $exit_code
+}
+
+kill_background_process() {
+    local process_name="$1"
+    local force="${2:-false}"
+    
+    if [[ -z "$process_name" ]]; then
+        log_error "Process name required for kill operation"
+        return 1
+    fi
+    
+    if [[ -z "${BACKGROUND_PROCESSES[$process_name]:-}" ]]; then
+        log_warn "No background process found with name: $process_name"
+        return 1
+    fi
+    
+    local bg_pid="${BACKGROUND_PROCESSES[$process_name]}"
+    
+    if [[ "$QUIET_MODE" != "true" ]]; then
+        log_info "Terminating background process: $process_name (PID: $bg_pid)"
+    fi
+    
+    # Check if process is still running
+    if ! kill -0 "$bg_pid" 2>/dev/null; then
+        log_info "Background process already terminated: $process_name"
+        unset BACKGROUND_PROCESSES["$process_name"]
+        return 0
+    fi
+    
+    # Try graceful termination first
+    if kill -TERM "$bg_pid" 2>/dev/null; then
+        # Wait up to 5 seconds for graceful termination
+        local count=0
+        while kill -0 "$bg_pid" 2>/dev/null && [[ $count -lt 5 ]]; do
+            sleep 1
+            ((count++))
+        done
+        
+        # If still running and force is requested, use KILL
+        if kill -0 "$bg_pid" 2>/dev/null; then
+            if [[ "$force" == "true" ]]; then
+                log_warn "Force killing background process: $process_name"
+                kill -KILL "$bg_pid" 2>/dev/null || true
+            else
+                log_warn "Background process did not terminate gracefully: $process_name"
+                return 1
+            fi
+        fi
+    else
+        log_error "Failed to send termination signal to background process: $process_name"
+        return 1
+    fi
+    
+    # Remove from tracking
+    unset BACKGROUND_PROCESSES["$process_name"]
+    
+    if [[ "$QUIET_MODE" != "true" ]]; then
+        log_success "Background process terminated: $process_name"
+    fi
+    
+    return 0
+}
+
+# Background error logging functions
+initialize_background_logging() {
+    local background_log_path
+    background_log_path=$(get_background_log_path)
+
+    # Create background error log with header
+    {
+        echo "BRACK BACKGROUND PROCESS LOG"
+        echo "============================"
+        echo "Started: $(date '+%Y-%m-%d %H:%M:%S')"
+        echo ""
+    } > "$background_log_path"
+
+    # Track that we have initialized logging but no processes started yet
+    export BACKGROUND_PROCESSES_STARTED="false"
+
+    if [[ "$QUIET_MODE" != "true" ]]; then
+        log_info "Background process logging initialized: $background_log_path"
+    fi
+}
+
+cleanup_background_logging() {
+    local background_log_path
+    background_log_path=$(get_background_log_path)
+
+    if [[ -f "$background_log_path" ]]; then
+        # If no background processes were started, always clean up the log file
+        if [[ "${BACKGROUND_PROCESSES_STARTED:-false}" == "false" ]]; then
+            rm -f "$background_log_path"
+            if [[ "$QUIET_MODE" != "true" ]]; then
+                log_info "Background process logging cleaned up (no processes started)"
+            fi
+        else
+            # Check if there were any errors in background processes
+            if grep -q "ERROR\|FAILED\|failed" "$background_log_path" 2>/dev/null; then
+                log_warn "Background process errors detected. Check: $background_log_path"
+            else
+                # Remove log file if no errors
+                rm -f "$background_log_path"
+                if [[ "$QUIET_MODE" != "true" ]]; then
+                    log_info "Background process logging cleaned up (no errors)"
+                fi
+            fi
+        fi
+    fi
+}
+
+# GitHub Push Implementation functions
+check_git_remote_origin() {
+    if git remote get-url origin >/dev/null 2>&1; then
+        local origin_url
+        origin_url=$(git remote get-url origin)
+        if [[ "$QUIET_MODE" != "true" ]]; then
+            log_info "Remote origin found: $origin_url"
+        fi
+        return 0
+    else
+        log_error "No remote origin configured"
+        return 1
+    fi
+}
+
+check_github_authentication() {
+    # Check if gh CLI is available and authenticated
+    if ! command -v gh >/dev/null 2>&1; then
+        log_error "GitHub CLI (gh) not found. Please install: https://cli.github.com/"
+        return 1
+    fi
+    
+    # Check authentication status
+    if gh auth status >/dev/null 2>&1; then
+        if [[ "$QUIET_MODE" != "true" ]]; then
+            log_info "GitHub CLI authenticated"
+        fi
+        return 0
+    else
+        log_error "GitHub CLI not authenticated. Run: gh auth login"
+        return 1
+    fi
+}
+
+push_branch_with_retry() {
+    local branch="$1"
+    local max_attempts="${2:-3}"
+    local base_delay="${3:-2}"  # Base delay in seconds
+    
+    if [[ -z "$branch" ]]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: Branch name required for push operation" >&2
+        return 1
+    fi
+    
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting push operation for branch: $branch" >&2
+    
+    local attempt=1
+    local delay=$base_delay
+    
+    while [[ $attempt -le $max_attempts ]]; do
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] Push attempt $attempt/$max_attempts for branch: $branch" >&2
+        
+        # Try to push the branch
+        local push_output
+        local push_exit_code
+        
+        # Use --force-with-lease for safer force push
+        push_output=$(git push --force-with-lease -u origin "$branch" 2>&1)
+        push_exit_code=$?
+        
+        if [[ $push_exit_code -eq 0 ]]; then
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] Successfully pushed branch: $branch" >&2
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] Push output: $push_output" >&2
+            return 0
+        else
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] Push attempt $attempt failed with exit code $push_exit_code" >&2
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] Push error: $push_output" >&2
+            
+            # Check for specific error types
+            if [[ "$push_output" =~ "Authentication failed" || "$push_output" =~ "permission denied" ]]; then
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] Authentication error detected - aborting retries" >&2
+                return 2  # Authentication error
+            elif [[ "$push_output" =~ "Connection refused" || "$push_output" =~ "Network is unreachable" ]]; then
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] Network error detected - will retry" >&2
+            elif [[ "$push_output" =~ "rejected" && "$push_output" =~ "non-fast-forward" ]]; then
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] Non-fast-forward push rejected - will retry with force" >&2
+            fi
+            
+            # If this was the last attempt, return the error
+            if [[ $attempt -eq $max_attempts ]]; then
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] All push attempts failed for branch: $branch" >&2
+                return $push_exit_code
+            fi
+            
+            # Wait before retrying (exponential backoff)
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] Waiting ${delay}s before retry..." >&2
+            sleep "$delay"
+            delay=$((delay * 2))  # Exponential backoff
+            ((attempt++))
+        fi
+    done
+    
+    return 1  # Should never reach here
+}
+
+push_formatting_branch_background() {
+    local formatting_branch="$FORMATTING_BRANCH"
+    
+    if [[ -z "$formatting_branch" ]]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: No formatting branch available for push" >&2
+        return 1
+    fi
+    
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Background: Pushing formatting branch $formatting_branch" >&2
+    
+    # Check remote configuration
+    if ! check_git_remote_origin >/dev/null 2>&1; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: Remote origin not configured" >&2
+        return 1
+    fi
+    
+    # Check GitHub authentication  
+    if ! check_github_authentication >/dev/null 2>&1; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: GitHub authentication failed" >&2
+        return 2
+    fi
+    
+    # Perform the push with retry logic
+    local push_result
+    push_result=$(push_branch_with_retry "$formatting_branch" 3 2)
+    local push_exit_code=$?
+    
+    if [[ $push_exit_code -eq 0 ]]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] Successfully pushed formatting branch: $formatting_branch" >&2
+        return 0
+    elif [[ $push_exit_code -eq 2 ]]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] Authentication error pushing branch: $formatting_branch" >&2
+        return 2
+    else
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] Failed to push formatting branch: $formatting_branch" >&2
+        return 1
+    fi
+}
+
+# Wrapper to start GitHub push in background
+start_github_push_background() {
+    local formatting_branch="$FORMATTING_BRANCH"
+    
+    if [[ -z "$formatting_branch" ]]; then
+        log_warn "No formatting branch available for background push"
+        return 1
+    fi
+    
+    if [[ "$QUIET_MODE" != "true" ]]; then
+        log_info "Starting background GitHub push for: $formatting_branch"
+    fi
+    
+    # Start the push operation in background
+    start_background_process "github_push" "push_formatting_branch_background"
+
+    # Mark that we have started background processes
+    export BACKGROUND_PROCESSES_STARTED="true"
+
+    if [[ "$QUIET_MODE" != "true" ]]; then
+        log_success "GitHub push started in background"
+    fi
+
+    return 0
+}
+
+# GitHub PR Creation Implementation functions
+generate_pr_title() {
+    local formatting_branch="$1"
+    local file_count="${2:-0}"
+    
+    if [[ -z "$formatting_branch" ]]; then
+        echo "style: apply black formatting"
+        return 0
+    fi
+    
+    # Extract the original branch name from formatting branch
+    local original_branch="${formatting_branch%-auto-black-formatting}"
+    
+    echo "style: apply black formatting for $original_branch"
+}
+
+generate_pr_body() {
+    local formatting_branch="$1"
+    local original_branch="${2:-main}"
+    local file_list=("${@:3}")
+    
+    local pr_body
+    pr_body=$(cat << EOF
+## Summary
+
+This PR applies black formatting to Python files in the \`${formatting_branch%-auto-black-formatting}\` branch.
+
+## Changes
+
+This PR contains only formatting changes applied by the \`black\` Python code formatter. No functional changes have been made.
+
+EOF
+)
+    
+    # Add file list if provided
+    if [[ ${#file_list[@]} -gt 0 ]]; then
+        pr_body+=$(cat << EOF
+### Files Modified
+
+EOF
+)
+        for file in "${file_list[@]}"; do
+            pr_body+="- \`$file\`"$'\n'
+        done
+        pr_body+=$'\n'
+    fi
+    
+    read -r -d '' pr_body << EOF
+$pr_body
+## Review Notes
+
+- ✅ These are **formatting-only changes** with no functional modifications
+- ✅ All changes were applied automatically by \`black\`
+- ✅ Original functionality is preserved
+- ✅ Safe to merge without detailed code review
+
+## Merge Instructions
+
+This formatting PR can be safely merged into \`${original_branch}\` and then the changes can be merged back to the feature branch.
+
+---
+
+🤖 *Generated automatically by [brack](https://github.com/outofculture/brack) - Apply black formatting with clean diffs*
+EOF
+
+    echo "$pr_body"
+}
+
+check_existing_pr() {
+    local formatting_branch="$1"
+    local base_branch="${2:-main}"
+    
+    if [[ -z "$formatting_branch" ]]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: Branch name required for PR check" >&2
+        return 1
+    fi
+    
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Checking for existing PR: $formatting_branch -> $base_branch" >&2
+    
+    # Check if there's already a PR for this branch
+    local existing_pr_url
+    existing_pr_url=$(gh pr list --head "$formatting_branch" --base "$base_branch" --json url --jq '.[0].url' 2>/dev/null)
+    
+    if [[ -n "$existing_pr_url" && "$existing_pr_url" != "null" ]]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] Found existing PR: $existing_pr_url" >&2
+        echo "$existing_pr_url"
+        return 0
+    else
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] No existing PR found" >&2
+        return 1
+    fi
+}
+
+create_github_pr() {
+    local formatting_branch="$1"
+    local base_branch="${2:-main}"
+    local pr_title="$3"
+    local pr_body="$4"
+    
+    if [[ -z "$formatting_branch" || -z "$pr_title" ]]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: Branch name and title required for PR creation" >&2
+        return 1
+    fi
+    
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Creating GitHub PR: $formatting_branch -> $base_branch" >&2
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] PR Title: $pr_title" >&2
+    
+    # Create the PR using GitHub CLI
+    local pr_output
+    local pr_exit_code
+    
+    pr_output=$(gh pr create \
+        --head "$formatting_branch" \
+        --base "$base_branch" \
+        --title "$pr_title" \
+        --body "$pr_body" \
+        2>&1)
+    pr_exit_code=$?
+    
+    if [[ $pr_exit_code -eq 0 ]]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] Successfully created PR" >&2
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] PR Output: $pr_output" >&2
+        
+        # Extract PR URL from output
+        local pr_url
+        pr_url=$(echo "$pr_output" | grep -o 'https://github.com/[^/]*/[^/]*/pull/[0-9]*' | head -1)
+        if [[ -n "$pr_url" ]]; then
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] PR URL: $pr_url" >&2
+            echo "$pr_url"
+        fi
+        
+        return 0
+    else
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] Failed to create PR" >&2
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] Error: $pr_output" >&2
+        
+        # Check for specific error types
+        if [[ "$pr_output" =~ "Authentication failed" || "$pr_output" =~ "Bad credentials" ]]; then
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] Authentication error detected" >&2
+            return 2
+        elif [[ "$pr_output" =~ "already exists" ]]; then
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] PR may already exist" >&2
+            return 3
+        fi
+        
+        return 1
+    fi
+}
+
+update_github_pr() {
+    local pr_url="$1"
+    local pr_title="$2"
+    local pr_body="$3"
+    
+    if [[ -z "$pr_url" || -z "$pr_title" ]]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: PR URL and title required for PR update" >&2
+        return 1
+    fi
+    
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Updating GitHub PR: $pr_url" >&2
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] New Title: $pr_title" >&2
+    
+    # Update the PR using GitHub CLI
+    local update_output
+    local update_exit_code
+    
+    update_output=$(gh pr edit "$pr_url" \
+        --title "$pr_title" \
+        --body "$pr_body" \
+        2>&1)
+    update_exit_code=$?
+    
+    if [[ $update_exit_code -eq 0 ]]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] Successfully updated PR" >&2
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] Update Output: $update_output" >&2
+        return 0
+    else
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] Failed to update PR" >&2
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] Error: $update_output" >&2
+        return 1
+    fi
+}
+
+create_or_update_pr_background() {
+    local formatting_branch="$FORMATTING_BRANCH"
+    local main_branch="$MAIN_BRANCH"
+    local formatted_files=("${FORMATTED_FILES[@]}")
+    
+    if [[ -z "$formatting_branch" || -z "$main_branch" ]]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: Required branch variables not available" >&2
+        return 1
+    fi
+    
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Background: Creating or updating PR for $formatting_branch" >&2
+    
+    # Check GitHub authentication
+    if ! check_github_authentication >/dev/null 2>&1; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: GitHub authentication failed" >&2
+        return 2
+    fi
+    
+    # Generate PR content
+    local pr_title
+    local pr_body
+    
+    pr_title=$(generate_pr_title "$formatting_branch" "${#formatted_files[@]}")
+    pr_body=$(generate_pr_body "$formatting_branch" "$main_branch" "${formatted_files[@]}")
+    
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Generated PR title: $pr_title" >&2
+    
+    # Check for existing PR
+    local existing_pr_url
+    if existing_pr_url=$(check_existing_pr "$formatting_branch" "$main_branch"); then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] Updating existing PR: $existing_pr_url" >&2
+        
+        if update_github_pr "$existing_pr_url" "$pr_title" "$pr_body"; then
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] Successfully updated existing PR" >&2
+            return 0
+        else
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] Failed to update existing PR" >&2
+            return 1
+        fi
+    else
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] Creating new PR" >&2
+        
+        local new_pr_url
+        if new_pr_url=$(create_github_pr "$formatting_branch" "$main_branch" "$pr_title" "$pr_body"); then
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] Successfully created new PR: $new_pr_url" >&2
+            return 0
+        else
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] Failed to create new PR" >&2
+            return 1
+        fi
+    fi
+}
+
+# Wrapper to start GitHub PR creation in background
+start_github_pr_background() {
+    local formatting_branch="$FORMATTING_BRANCH"
+    
+    if [[ -z "$formatting_branch" ]]; then
+        log_warn "No formatting branch available for background PR creation"
+        return 1
+    fi
+    
+    if [[ "$QUIET_MODE" != "true" ]]; then
+        log_info "Starting background GitHub PR creation for: $formatting_branch"
+    fi
+    
+    # Start the PR creation operation in background
+    start_background_process "github_pr" "create_or_update_pr_background"
+
+    # Mark that we have started background processes
+    export BACKGROUND_PROCESSES_STARTED="true"
+
+    if [[ "$QUIET_MODE" != "true" ]]; then
+        log_success "GitHub PR creation started in background"
+    fi
+
+    return 0
+}
+
+# Black formatting integration functions
+check_black_availability() {
+    local black_exec=""
+
+    if [[ -n "$BLACK_PATH" ]]; then
+        # Use custom black path
+        black_exec="$BLACK_PATH"
+        if [[ ! -f "$black_exec" ]]; then
+            create_error_state "Custom black executable not found: $black_exec" "Black availability check"
+            exit $EXIT_GENERAL_ERROR
+        elif [[ ! -x "$black_exec" ]]; then
+            create_error_state "Custom black executable not executable: $black_exec" "Black availability check"
+            exit $EXIT_GENERAL_ERROR
+        fi
+    else
+        # Use default black from PATH
+        if command -v black >/dev/null 2>&1; then
+            black_exec=$(command -v black)
+        else
+            create_error_state "Black formatter not found in PATH. Please install black: pip install black" "Black availability check"
+            exit $EXIT_GENERAL_ERROR
+        fi
+    fi
+
+    # Test that black is working
+    if ! "$black_exec" --version >/dev/null 2>&1; then
+        create_error_state "Black executable failed version check: $black_exec" "Black availability check"
+        exit $EXIT_GENERAL_ERROR
+    fi
+
+    if [[ "$QUIET_MODE" != "true" ]]; then
+        log_info "Black formatter found: $black_exec"
+    fi
+
+    # Export the resolved black path for use by other functions
+    export RESOLVED_BLACK_PATH="$black_exec"
+    return 0
+}
+
+get_file_checksum() {
+    local file="$1"
+    
+    if [[ ! -f "$file" ]]; then
+        echo ""
+        return 1
+    fi
+    
+    # Use md5sum or equivalent for file checksum
+    if command -v md5sum >/dev/null 2>&1; then
+        md5sum "$file" | cut -d' ' -f1
+    elif command -v md5 >/dev/null 2>&1; then
+        md5 -q "$file"
+    else
+        # Fallback to file size and modification time
+        stat -c "%s-%Y" "$file" 2>/dev/null || stat -f "%z-%m" "$file" 2>/dev/null || echo "unknown"
+    fi
+}
+
+format_files_with_black() {
+    local files_to_format=("$@")
+    local files_changed=()
+    local black_cmd_args=()
+
+    # Use resolved black path (set by check_black_availability)
+    local black_exec="${RESOLVED_BLACK_PATH:-black}"
+    black_cmd_args=("$black_exec")
+
+    if [[ ${#files_to_format[@]} -eq 0 ]]; then
+        if [[ "$QUIET_MODE" != "true" ]]; then
+            log_info "No files to format"
+        fi
+        export FORMATTED_FILES=()
+        return 0
+    fi
+
+    # Add user-specified black arguments
+    if [[ ${#BLACK_ARGS[@]} -gt 0 ]]; then
+        black_cmd_args+=("${BLACK_ARGS[@]}")
+        if [[ "$QUIET_MODE" != "true" ]]; then
+            log_info "Using black arguments: ${BLACK_ARGS[*]}"
+        fi
+    fi
+    
+    if [[ "$QUIET_MODE" != "true" ]]; then
+        log_info "Formatting ${#files_to_format[@]} file(s) with black..."
+    fi
+    
+    # Get checksums before formatting
+    local -A checksums_before
+    for file in "${files_to_format[@]}"; do
+        checksums_before["$file"]=$(get_file_checksum "$file")
+    done
+    
+    # Run black on all files
+    black_cmd_args+=("${files_to_format[@]}")
+    
+    local black_exit_code
+    local black_output_file
+    black_output_file=$(mktemp)
+    
+    if "${black_cmd_args[@]}" >"$black_output_file" 2>&1; then
+        black_exit_code=0
+    else
+        black_exit_code=$?
+    fi
+    
+    local black_output
+    black_output=$(cat "$black_output_file")
+    rm -f "$black_output_file"
+    
+    if [[ $black_exit_code -ne 0 ]]; then
+        create_error_state "Black formatting failed (exit code $black_exit_code): $black_output" "Black formatting"
+        exit $EXIT_GENERAL_ERROR
+    fi
+    
+    # Check which files actually changed
+    for file in "${files_to_format[@]}"; do
+        local checksum_after
+        checksum_after=$(get_file_checksum "$file")
+        
+        if [[ "${checksums_before["$file"]}" != "$checksum_after" ]]; then
+            files_changed+=("$file")
+            if [[ "$QUIET_MODE" != "true" ]]; then
+                log_info "Formatted: $file"
+            fi
+        fi
+    done
+    
+    # Export results
+    export FORMATTED_FILES=("${files_changed[@]}")
+    
+    if [[ ${#files_changed[@]} -eq 0 ]]; then
+        if [[ "$QUIET_MODE" != "true" ]]; then
+            log_info "No files needed formatting changes"
+        fi
+    else
+        if [[ "$QUIET_MODE" != "true" ]]; then
+            log_success "Formatted ${#files_changed[@]} file(s)"
+        fi
+    fi
+    
+    return 0
+}
+
+format_existing_files() {
+    if [[ ${#EXISTING_FILES[@]} -eq 0 ]]; then
+        if [[ "$QUIET_MODE" != "true" ]]; then
+            log_info "No existing files to format"
+        fi
+        return 0
+    fi
+    
+    if [[ "$QUIET_MODE" != "true" ]]; then
+        log_info "Formatting existing files in formatting branch..."
+    fi
+    
+    format_files_with_black "${EXISTING_FILES[@]}"
+}
+
+format_new_files() {
+    if [[ ${#NEW_FILES[@]} -eq 0 ]]; then
+        if [[ "$QUIET_MODE" != "true" ]]; then
+            log_info "No new files to format"
+        fi
+        return 0
+    fi
+    
+    if [[ "$QUIET_MODE" != "true" ]]; then
+        log_info "Formatting new files in current branch..."
+    fi
+    
+    format_files_with_black "${NEW_FILES[@]}"
+}
+
+# Commit formatting changes functions
+stage_formatted_files() {
+    local files_to_stage=("$@")
+    
+    if [[ ${#files_to_stage[@]} -eq 0 ]]; then
+        if [[ "$QUIET_MODE" != "true" ]]; then
+            log_info "No files to stage"
+        fi
+        return 0
+    fi
+    
+    if [[ "$QUIET_MODE" != "true" ]]; then
+        log_info "Staging ${#files_to_stage[@]} formatted file(s)..."
+    fi
+    
+    # Stage each file individually for better error handling
+    local staged_files=()
+    for file in "${files_to_stage[@]}"; do
+        if [[ ! -f "$file" ]]; then
+            log_warn "File '$file' not found, skipping staging"
+            continue
+        fi
+        
+        if git add "$file" >/dev/null 2>&1; then
+            staged_files+=("$file")
+            if [[ "$QUIET_MODE" != "true" ]]; then
+                log_info "Staged: $file"
+            fi
+        else
+            log_warn "Failed to stage file: $file"
+        fi
+    done
+    
+    if [[ ${#staged_files[@]} -eq 0 ]]; then
+        log_warn "No files were successfully staged"
+        return 1
+    fi
+    
+    if [[ "$QUIET_MODE" != "true" ]]; then
+        log_success "Staged ${#staged_files[@]} file(s)"
+    fi
+    
+    return 0
+}
+
+create_formatting_commit() {
+    local commit_message="$1"
+    local file_count="$2"
+    
+    if [[ -z "$commit_message" ]]; then
+        create_error_state "Commit message not provided for formatting commit" "Commit creation"
+        exit $EXIT_GENERAL_ERROR
+    fi
+    
+    # Check if there are actually staged changes
+    if ! git diff --cached --quiet >/dev/null 2>&1; then
+        if [[ "$QUIET_MODE" != "true" ]]; then
+            log_info "Creating formatting commit..."
+        fi
+        
+        if git commit -m "$commit_message" >/dev/null 2>&1; then
+            if [[ "$QUIET_MODE" != "true" ]]; then
+                log_success "Created formatting commit: $commit_message"
+            fi
+            return 0
+        else
+            create_error_state "Failed to create formatting commit" "Commit creation"
+            exit $EXIT_GENERAL_ERROR
+        fi
+    else
+        if [[ "$QUIET_MODE" != "true" ]]; then
+            log_info "No staged changes to commit"
+        fi
+        return 1  # No changes to commit
+    fi
+}
+
+commit_existing_files() {
+    if [[ ${#FORMATTED_FILES[@]} -eq 0 ]]; then
+        if [[ "$QUIET_MODE" != "true" ]]; then
+            log_info "No existing files were formatted, skipping commit"
+        fi
+        return 0
+    fi
+    
+    if [[ "$QUIET_MODE" != "true" ]]; then
+        log_info "Committing formatted existing files..."
+    fi
+    
+    # Stage the formatted files
+    if ! stage_formatted_files "${FORMATTED_FILES[@]}"; then
+        log_warn "Failed to stage formatted files, skipping commit"
+        return 1
+    fi
+    
+    # Create commit message
+    local file_count=${#FORMATTED_FILES[@]}
+    local commit_msg
+    if [[ $file_count -eq 1 ]]; then
+        commit_msg="style: apply black formatting to ${FORMATTED_FILES[0]}"
+    else
+        commit_msg="style: apply black formatting to $file_count files"
+    fi
+    
+    # Create the commit
+    if create_formatting_commit "$commit_msg" "$file_count"; then
+        if [[ "$QUIET_MODE" != "true" ]]; then
+            log_success "Committed formatting changes for existing files"
+        fi
+        return 0
+    else
+        if [[ "$QUIET_MODE" != "true" ]]; then
+            log_info "No formatting changes to commit for existing files"
+        fi
+        return 1
+    fi
+}
+
+commit_new_files() {
+    if [[ ${#FORMATTED_FILES[@]} -eq 0 ]]; then
+        if [[ "$QUIET_MODE" != "true" ]]; then
+            log_info "No new files were formatted, skipping commit"
+        fi
+        return 0
+    fi
+    
+    if [[ "$QUIET_MODE" != "true" ]]; then
+        log_info "Committing formatted new files..."
+    fi
+    
+    # Stage the formatted files
+    if ! stage_formatted_files "${FORMATTED_FILES[@]}"; then
+        log_warn "Failed to stage formatted new files, skipping commit"
+        return 1
+    fi
+    
+    # Create commit message
+    local file_count=${#FORMATTED_FILES[@]}
+    local commit_msg
+    if [[ $file_count -eq 1 ]]; then
+        commit_msg="style: apply black formatting to new file ${FORMATTED_FILES[0]}"
+    else
+        commit_msg="style: apply black formatting to $file_count new files"
+    fi
+    
+    # Create the commit
+    if create_formatting_commit "$commit_msg" "$file_count"; then
+        if [[ "$QUIET_MODE" != "true" ]]; then
+            log_success "Committed formatting changes for new files"
+        fi
+        return 0
+    else
+        if [[ "$QUIET_MODE" != "true" ]]; then
+            log_info "No formatting changes to commit for new files"
+        fi
+        return 1
+    fi
+}
+
+commit_formatting_changes() {
+    local current_branch
+    current_branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
+    
+    if [[ -z "$current_branch" ]]; then
+        create_error_state "Unable to determine current branch for commit operations" "Commit workflow"
+        exit $EXIT_GENERAL_ERROR
+    fi
+    
+    # Determine if we're on formatting branch or original branch
+    if [[ "$current_branch" == "$FORMATTING_BRANCH" ]]; then
+        # We're on formatting branch, commit existing files
+        commit_existing_files
+    elif [[ "$current_branch" == "$ORIGINAL_BRANCH" ]]; then
+        # We're on original branch, commit new files
+        commit_new_files
+    else
+        log_warn "Unexpected branch '$current_branch' during commit operations"
+        return 1
+    fi
+}
+
+# Performance timing functions
+get_timestamp_ms() {
+    # Get current timestamp in milliseconds
+    if command -v gdate >/dev/null 2>&1; then
+        # macOS with GNU coreutils
+        gdate +%s%3N
+    elif date --version >/dev/null 2>&1; then
+        # GNU date (Linux)
+        date +%s%3N
+    else
+        # Fallback for systems without millisecond precision
+        echo $(($(date +%s) * 1000))
+    fi
+}
+
+calculate_duration() {
+    local start_time="$1"
+    local end_time="$2"
+    local duration=$((end_time - start_time))
+    echo "$duration"
+}
+
+validate_performance_timing() {
+    local duration_ms="$1"
+    local max_duration_ms="${2:-1000}"  # Default 1 second
+    
+    if [[ $duration_ms -gt $max_duration_ms ]]; then
+        log_warn "Performance requirement not met: ${duration_ms}ms > ${max_duration_ms}ms"
+        return 1
+    else
+        if [[ "$QUIET_MODE" != "true" ]]; then
+            log_success "Performance requirement met: ${duration_ms}ms ≤ ${max_duration_ms}ms"
+        fi
+        return 0
+    fi
+}
+
+# Complete main workflow with all integrations
+main_workflow() {
+    local workflow_start_time
+    workflow_start_time=$(get_timestamp_ms)
+    
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_info "DRY RUN: No git changes will be made"
+        check_black_availability
+        detect_and_validate_merge_base
+        validate_and_categorize_files
+        log_info "DRY RUN: Would format ${#EXISTING_FILES[@]} existing file(s) in a new formatting branch"
+        log_info "DRY RUN: Would format ${#NEW_FILES[@]} new file(s) in the current branch"
+        if [[ ${#EXISTING_FILES[@]} -gt 0 ]]; then
+            log_info "DRY RUN: Would push formatting branch and open a PR"
+        fi
+
+        local workflow_end_time
+        workflow_end_time=$(get_timestamp_ms)
+        local duration
+        duration=$(calculate_duration "$workflow_start_time" "$workflow_end_time")
+        log_info "DRY RUN: Completed in ${duration}ms"
+        return 0
+    fi
+
+    # Initial output (quiet mode will be minimal)
+    if [[ "$QUIET_MODE" != "true" ]]; then
+        log_info "🚀 brack: Apply black formatting with clean feature branch diffs"
+        log_info "Current branch: $CURRENT_BRANCH"  
+        log_info "Files to process: ${FILES[*]:-all Python files}"
+    fi
+    
+    # Phase 1: Prerequisites and Setup
+    local phase_start_time
+    phase_start_time=$(get_timestamp_ms)
+    
+    # Comprehensive error handling for setup phase
+    if ! check_black_availability; then
+        emergency_cleanup "Black formatter not available"
+        return 1
+    fi
+    
+    if ! detect_and_validate_merge_base; then
+        emergency_cleanup "Failed to detect merge-base"
+        return 1
+    fi
+    
+    if ! validate_and_categorize_files; then
+        emergency_cleanup "File validation failed"
+        return 1
+    fi
+    
+    # Early exit if no files need formatting
+    if [[ ${#EXISTING_FILES[@]} -eq 0 && ${#NEW_FILES[@]} -eq 0 ]]; then
+        if [[ "$QUIET_MODE" != "true" ]]; then
+            log_info "No Python files found to format"
+        fi
+        return 0
+    fi
+    
+    # Prepare formatting branch and ensure working directory is saved before switching
+    if ! prepare_formatting_branch; then
+        emergency_cleanup "Failed to prepare formatting branch"
+        return 1
+    fi
+    
+    local phase_end_time
+    phase_end_time=$(get_timestamp_ms)
+    local phase_duration
+    phase_duration=$(calculate_duration "$phase_start_time" "$phase_end_time")
+    
+    if [[ "$QUIET_MODE" != "true" ]]; then
+        log_info "✅ Setup completed in ${phase_duration}ms"
+    fi
+    
+    # Phase 2: Format Existing Files (in formatting branch)
+    if [[ ${#EXISTING_FILES[@]} -gt 0 ]]; then
+        phase_start_time=$(get_timestamp_ms)
+        
+        if [[ "$QUIET_MODE" != "true" ]]; then
+            log_info "📝 Formatting ${#EXISTING_FILES[@]} existing file(s) in formatting branch..."
+        fi
+        
+        # Format existing files in formatting branch with error handling
+        if ! format_existing_files; then
+            emergency_cleanup "Failed to format existing files"
+            return 1
+        fi
+        
+        # Commit formatting changes for existing files
+        if ! commit_formatting_changes; then
+            log_warn "Failed to commit formatting changes for existing files"
+            # Continue anyway as this is not critical
+        fi
+        
+        # Start background GitHub push and PR creation (fire-and-forget, non-critical)
+        if [[ ${#FORMATTED_FILES[@]} -gt 0 ]]; then
+            start_github_push_background || log_warn "Failed to start background GitHub push"
+            # Start PR creation regardless of whether push succeeds - it will handle its own errors
+            start_github_pr_background || log_warn "Failed to start background GitHub PR creation"
+        fi
+        
+        phase_end_time=$(get_timestamp_ms)
+        phase_duration=$(calculate_duration "$phase_start_time" "$phase_end_time")
+        
+        if [[ "$QUIET_MODE" != "true" ]]; then
+            log_success "✅ Existing files processed in ${phase_duration}ms"
+        fi
+    fi
+    
+    # Phase 3: Return to Original Branch and Format New Files
+    phase_start_time=$(get_timestamp_ms)
+    
+    # Return to original branch to format new files with error handling
+    if ! return_to_original_branch; then
+        emergency_cleanup "Failed to return to original branch"
+        return 1
+    fi
+    
+    # Phase 3a: Format NEW_FILES in current branch (critical for workflow)
+    if [[ ${#NEW_FILES[@]} -gt 0 ]]; then
+        if [[ "$QUIET_MODE" != "true" ]]; then
+            log_info "📝 Formatting ${#NEW_FILES[@]} new file(s) in current branch..."
+        fi
+        
+        # Format new files in current branch with error handling
+        if ! format_new_files; then
+            emergency_cleanup "Failed to format new files"
+            return 1
+        fi
+        
+        # For new files, formatting should be committed to the current branch
+        # This ensures new files are formatted before they are first committed
+        if [[ ${#FORMATTED_FILES[@]} -gt 0 ]]; then
+            if ! commit_formatting_changes; then
+                log_warn "New files formatted but not committed - they will remain staged"
+                # This is acceptable - the formatted files are staged for the user's next commit
+            fi
+        fi
+    fi
+    
+    phase_end_time=$(get_timestamp_ms)
+    phase_duration=$(calculate_duration "$phase_start_time" "$phase_end_time")
+    
+    if [[ "$QUIET_MODE" != "true" ]]; then
+        log_success "✅ New files processed in ${phase_duration}ms"
+    fi
+    
+    # Phase 4: Merge and Cleanup
+    phase_start_time=$(get_timestamp_ms)
+    
+    if [[ ${#EXISTING_FILES[@]} -gt 0 ]]; then
+        if [[ "$QUIET_MODE" != "true" ]]; then
+            log_info "🔀 Merging formatting changes..."
+        fi
+        
+        # Merge formatting changes back to original branch with error handling
+        if ! merge_and_cleanup_formatting_branch; then
+            emergency_cleanup "Failed to merge formatting changes"
+            return 1
+        fi
+    fi
+    
+    # Restore stashed changes
+    restore_working_directory || true
+    
+    # After restoring stashed changes, format new files again to apply formatting to local changes
+    if [[ ${#NEW_FILES[@]} -gt 0 && "$STASH_CREATED" == "true" ]]; then
+        if [[ "$QUIET_MODE" != "true" ]]; then
+            log_info "🎨 Applying black formatting to restored local changes..."
+        fi
+        
+        # Format new files with user-specified black arguments
+        format_files_with_black "${NEW_FILES[@]}" || log_warn "Failed to format restored local changes"
+        
+        if [[ "$QUIET_MODE" != "true" ]]; then
+            log_success "Local changes formatted"
+        fi
+    fi
+    
+    phase_end_time=$(get_timestamp_ms)
+    phase_duration=$(calculate_duration "$phase_start_time" "$phase_end_time")
+    
+    if [[ "$QUIET_MODE" != "true" ]]; then
+        log_success "✅ Merge and cleanup completed in ${phase_duration}ms"
+    fi
+    
+    # Final Performance Validation
+    local workflow_end_time
+    workflow_end_time=$(get_timestamp_ms)
+    local total_duration
+    total_duration=$(calculate_duration "$workflow_start_time" "$workflow_end_time")
+    
+    # Final output - different for quiet vs normal mode
+    local total_files=$((${#EXISTING_FILES[@]} + ${#NEW_FILES[@]}))
+    local formatted_files_count=0
+    
+    # Count actual formatted files across all phases
+    # Note: FORMATTED_FILES gets reset between phases, so we track the total
+    if [[ ${#EXISTING_FILES[@]} -gt 0 || ${#NEW_FILES[@]} -gt 0 ]]; then
+        formatted_files_count=$((${#EXISTING_FILES[@]} + ${#NEW_FILES[@]}))
+    fi
+    
+    if [[ "$QUIET_MODE" == "true" ]]; then
+        # Minimal IDE-friendly output
+        if [[ $formatted_files_count -gt 0 ]]; then
+            echo "brack: formatted $formatted_files_count file(s) in ${total_duration}ms"
+        fi
+        # Performance warning only if significantly over target
+        if [[ $total_duration -gt 2000 ]]; then
+            echo "brack: warning: slow performance ${total_duration}ms" >&2
+        fi
+    else
+        log_success "🎉 Workflow completed successfully in ${total_duration}ms"
+        
+        # Validate performance requirement (<1000ms for local operations)
+        validate_performance_timing "$total_duration" 1000 || log_warn "Consider optimizing performance for faster IDE integration"
+        
+        # Provide summary
+        log_info "📊 Summary: Processed $total_files file(s) in ${total_duration}ms"
+        
+        if [[ ${#EXISTING_FILES[@]} -gt 0 ]]; then
+            log_info "🔄 Background operations: GitHub push and PR creation in progress"
+        fi
+    fi
+    
+    return 0
+}
+
+# Main entry point
+main() {
+    # Setup signal handlers for emergency cleanup
+    setup_signal_handlers
+    
+    # Parse command line arguments first to set QUIET_MODE
+    parse_arguments "$@"
+    
+    # Initialize background process logging after QUIET_MODE is set
+    initialize_background_logging
+
+    # Handle cleanup mode
+    if [[ "$CLEANUP_MODE" == "true" ]]; then
+        cleanup_error_state
+        cleanup_background_logging
+        exit $EXIT_SUCCESS
+    fi
+
+    # Check for error state (Step 3)
+    check_error_state
+
+    # Validate git environment (Step 2)
+    validate_git_environment
+
+    # Run main workflow
+    main_workflow
+    
+    # Clean up
+    cleanup_background_logging
+    cleanup_signal_handlers
+}
+
+# Run main function with all arguments
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi
